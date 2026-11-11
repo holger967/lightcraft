@@ -978,7 +978,7 @@ impl Session {
     /// their sections' eyes) while it is on, shrinks the crop about its centre until no blank corner
     /// is left, so the Crop tool shows what the render keeps. An edit of the crop itself is left as
     /// drawn (the render still constrains it).
-    fn fit_constrained_crop(&self, id: PhotoId, mut d: DevelopSettings) -> DevelopSettings {
+    pub(crate) fn fit_constrained_crop(&self, id: PhotoId, mut d: DevelopSettings) -> DevelopSettings {
         if !d.geometry.constrain_crop {
             return d;
         }

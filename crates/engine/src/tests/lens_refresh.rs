@@ -96,6 +96,56 @@ fn each_result_reaches_its_photos_virtual_copies_and_no_others() {
     }
 }
 
+const CHOICE_DB: &str = r#"<lensdatabase>
+  <camera><maker>Testcam</maker><model>TC-1</model><mount>T</mount><cropfactor>1.5</cropfactor></camera>
+  <lens><maker>Testcam</maker><model>Testcam 18-200mm f/3.5-6.3</model><mount>T</mount><cropfactor>1.5</cropfactor>
+    <calibration><distortion model="ptlens" focal="18" a="0.01" b="-0.02" c="0"/><distortion model="ptlens" focal="200" a="0" b="0.006" c="0"/></calibration>
+  </lens></lensdatabase>"#;
+
+/// A chosen profile is applied to the photo and, when asked, to every photo with the same camera
+/// and lens name, as one undo step. Another lens on the same body is left alone.
+#[test]
+fn a_chosen_profile_goes_on_matching_photos_and_undoes_as_one_step() {
+    let mut s = Session::new();
+    for (id, lens_name, focal) in [(1, "18-200mm f/3.5-6.3", 18.0), (2, "18-200mm f/3.5-6.3", 18.0), (3, "50mm F1.8", 50.0)] {
+        let mut p = raw(id, lens_name, false);
+        p.meta.focal_mm = Some(focal as f32);
+        p.meta.aperture = Some(if focal == 18.0 { 3.5 } else { 1.8 });
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    }
+    let db = lightcraft_lensdb::LensDb::parse(CHOICE_DB).unwrap();
+    let key = db.lenses[0].key();
+    let applied = crate::cmd::lens_refresh::apply_choice(&mut s, &db, key, vec![PhotoId(1)], true).unwrap();
+    assert_eq!(applied, vec![PhotoId(1), PhotoId(2)], "the same lens on the same body comes along");
+    for id in [1, 2] {
+        let p = s.catalog.photo(PhotoId(id)).unwrap();
+        assert_eq!(p.embedded_lens.map(|l| l.source), Some(LensSource::Manual), "photo {id} has the chosen profile");
+        assert!(p.develop.optics.lens_profile, "photo {id} has the correction switched on");
+    }
+    assert!(s.catalog.photo(PhotoId(3)).unwrap().embedded_lens.is_none(), "another lens is left alone");
+    s.execute("edit.undo", &json!({})).unwrap();
+    for id in [1, 2] {
+        let p = s.catalog.photo(PhotoId(id)).unwrap();
+        assert!(p.embedded_lens.is_none(), "undo takes the profile off photo {id}");
+        assert!(!p.develop.optics.lens_profile, "undo switches photo {id} back off");
+    }
+}
+
+/// A profile the user picked by hand stays: a database refresh replaces automatic matches and
+/// retries photos without one, never a deliberate choice.
+#[test]
+fn a_manual_choice_is_not_looked_up_again() {
+    let mut s = Session::new();
+    let mut p = raw(1, "18-200mm f/3.5-6.3", false);
+    p.embedded_lens = Some(EmbeddedLens { source: LensSource::Manual, profile_key: Some(42), ..lens(-0.02) });
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    let db = lightcraft_lensdb::LensDb::parse(DB).unwrap();
+    assert!(
+        crate::cmd::lens_refresh::missing(&s.catalog, &db, None, true).is_empty(),
+        "a chosen profile is the user's, not the database's to replace"
+    );
+}
+
 /// A raw in a library folder, as an older import left it: no lens data.
 fn raw(id: u64, lens_name: &str, edited: bool) -> Photo {
     let mut p =

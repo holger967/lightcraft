@@ -37,17 +37,24 @@ edited one keeps its settings. When a download replaced the database's files, th
 old database are read again too (they get the new profile, or lose one it no longer gives), and so are raws whose
 file named no lens at import. Ticking **Enable Lens Corrections** on a photo without a profile looks it up again
 too. `library.refreshLensProfiles` (`all: true` for the wider pass), `lens.downloadDatabase` (which also selects the
-downloaded folder) and `lens.databaseStatus` do the same for agents.
+downloaded folder), `lens.databaseStatus`, and the picker's `optics.lensCandidates` / `optics.chooseLensProfile` do
+the same for agents (each candidate's `key` is a string, so a client whose JSON numbers are doubles keeps the 64-bit
+key exact).
 
 A database profile is pinned to the photo: every render (fresh decode, cached preview, thumbnail, export) uses the
 profile the catalog holds, never one a decode looked up in a newer database, and the profile is part of the render
 and thumbnail cache keys, so a changed profile never shows an old cached render. A file's own correction comes from
 the file as before.
 
-The Optics panel says which profile is loaded: "Profile: from the file", "Profile: <lens> (lens database)", or
-"No lens profile found for <lens>". A profile is never copied between photos: presets, Copy / Paste, Sync and Auto
-Sync carry Enable Lens Corrections and its amounts, and each photo keeps the profile of its own lens
-(`crates/engine/src/tests/lens_refresh.rs`).
+The Optics panel says which profile is loaded: "Profile: from the file", "Profile: <lens> (lens database)",
+"Profile: <lens> (chosen)", or "No lens profile found for <lens>". When the automatic match fails, its picker lists
+the plausible profiles rather than the whole database: the camera's mount, then the focal and aperture ranges in the
+file's lens name (an 18–200 mm f/3.5–6.3 file shows the 18–200 f/3.5–6.3 lenses, not every 18–200 and not the
+f/3.5–5.6 ones). A choice is stored on the photo as `LensSource::Manual` with the profile's stable key, so a database
+refresh leaves it alone and the panel can still name it, and "Apply to all photos with this lens" gives it to every
+photo with the same camera and lens metadata as one undo step (`cmd:optics.chooseLensProfile`). A profile is never
+copied between photos by presets, Copy / Paste, Sync or Auto Sync: those carry Enable Lens Corrections and its
+amounts, and each photo keeps its own profile (`crates/engine/src/tests/lens_refresh.rs`).
 
 Files are read once per folder and again after a download. Invalid files are skipped with a warning in the log.
 Each read logs the folder, whether it is the download or `LIGHTCRAFT_LENSFUN_DIR`, and how many lenses and cameras
@@ -68,7 +75,9 @@ file the lens is looked up by a name built from the specification, `24-70mm f/2.
 The specification fits every maker's lens with that range (a Nikkor, a Sigma, a Tamron), so neither a partial match
 nor a name with a maker in it ("Samyang 85mm f/1.4" for "85mm f/1.4") is taken; a database that should correct such
 files names its profile that way, e.g. a lensfun entry with an extra `<model>24-70mm f/2.8</model>` for the one
-24-70 f/2.8 the photographer owns. lensfun's own database has no such names, so it doesn't correct these files.
+24-70 f/2.8 the photographer owns. lensfun's own database has no such names, so the automatic lookup doesn't correct
+these files; the Optics picker is the way to choose the right 18–200 (or Tamron, Sigma…) by hand, and the choice is
+remembered for the other photos with the same camera and lens metadata.
 
 | Correction | Models | Interpolated over |
 |---|---|---|
@@ -95,6 +104,7 @@ match score still wins even when its crop is unknown.
 
 - Only raws: rendered images (JPEG, HEIF, TIFF) are often already corrected in camera.
 - The focus distance is not read from maker notes yet: vignetting uses the farthest calibrated distance.
-- No manual make / model picker and no choice between sources (in the file, lens database, an own calibration)
-  yet; matching is automatic, the file's own correction wins.
+- No own calibration or custom profile yet; a file whose metadata cannot name its lens can be given a database
+  profile by hand from the candidate list. Choosing between sources (the file's correction vs a database profile)
+  still follows the fixed order: the file's own correction wins.
 - Not yet validated against real photos and another renderer; the tests use synthetic profiles and grids.

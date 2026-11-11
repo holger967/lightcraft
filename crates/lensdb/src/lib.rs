@@ -193,6 +193,111 @@ impl LensDb {
         self.best_lens(lens_make, name, camera, |l| l.names_exactly(name))
     }
 
+    /// The lens profile under a stable [`Profile::key`] (the first calibration, for display).
+    pub fn profile_by_key(&self, key: u64) -> Option<&Profile> {
+        self.lenses.iter().find(|l| l.key() == key)
+    }
+
+    /// The calibration of `key` whose crop factor best fits `camera` (a lens can carry one per
+    /// sensor format); with no crop factor on either, the first.
+    pub fn profile_for_camera(&self, key: u64, camera: Option<&Camera>) -> Option<&Profile> {
+        let crop = camera.and_then(|c| c.crop_factor);
+        self.lenses.iter().filter(|l| l.key() == key).min_by(|a, b| crop_distance(a.crop_factor, crop).total_cmp(&crop_distance(b.crop_factor, crop)))
+    }
+
+    /// The plausible profiles for a photo whose lens names itself `lens_model` (the EXIF lens
+    /// model, or a name built from its specification) on `camera`: the camera's mount, and the
+    /// focal and aperture ranges the name gives. A candidate list for a manual picker, where the
+    /// database's exact-name matching is too strict (a Nikon DSLR that records "18-200mm
+    /// f/3.5-6.3" for a lens the database names "Tamron AF 18-200mm f/3.5-6.3 XR Di II…").
+    ///
+    /// Profiles with no usable focal range are left out when the file names one; a profile whose
+    /// name gives no aperture is kept (it may still be the lens). The maker matching `lens_make`
+    /// ranks first, then the closest focal and aperture ranges, then shared words. One entry per
+    /// [`Profile::key`], the calibration nearest the camera's crop factor.
+    pub fn candidates(&self, camera: Option<&Camera>, lens_model: &str, lens_make: Option<&str>) -> Vec<&Profile> {
+        let file = spec_from_name(lens_model);
+        let make = lens_make.map(tokens).unwrap_or_default();
+        let words: Vec<String> = tokens(lens_model).into_iter().filter(|t| !is_number(t) && t != "mm" && t != "f").collect();
+        let mut found: Vec<(f64, &Profile)> = Vec::new();
+        for p in &self.lenses {
+            if let Some(cam) = camera
+                && !cam.mount.is_empty()
+                && !p.mounts.is_empty()
+                && !p.mounts.iter().any(|m| m.eq_ignore_ascii_case(&cam.mount))
+            {
+                continue;
+            }
+            let p_focal = p.focal_range();
+            let p_aperture = p.aperture_range();
+            if let Some(spec) = file {
+                let Some((pmin, pmax)) = p_focal else { continue };
+                let (fmin, fmax) = spec.focal;
+                if pmin > fmin * 1.10 || pmin < fmin * 0.90 || pmax < fmax * 0.90 || pmax > fmax * 1.10 {
+                    continue;
+                }
+                if let (Some((amin, amax)), Some((pamin, pmax_ap))) = (spec.aperture, p_aperture)
+                    && ((pmax_ap - amax).abs() > (amax.abs() * 0.08).max(0.2) || (pamin - amin).abs() > (amin.abs() * 0.12).max(0.2))
+                {
+                    continue;
+                }
+            }
+            let mut score = 0.0;
+            if !make.is_empty() && maker_matches(&tokens(&p.maker), &make) {
+                score += 2.0;
+            }
+            if let Some(spec) = file {
+                if let Some((pmin, pmax)) = p_focal {
+                    let d = ((pmin - spec.focal.0).abs() / spec.focal.0.max(1.0) + (pmax - spec.focal.1).abs() / spec.focal.1.max(1.0)).min(2.0);
+                    score += 2.0 - d;
+                }
+                if let (Some((amin, amax)), Some((pamin, pmax_ap))) = (spec.aperture, p_aperture) {
+                    score += 1.0 - ((pamin - amin).abs() + (pmax_ap - amax).abs()).min(2.0) / 2.0;
+                }
+            }
+            if let Some(primary) = p.models.first() {
+                let db_words = tokens(primary);
+                let common = words.iter().filter(|w| db_words.contains(w)).count();
+                score += common as f64 / words.len().max(1) as f64;
+            }
+            if let (Some(crop), Some(calibration)) = (camera.and_then(|c| c.crop_factor), p.crop_factor) {
+                score += (1.0 - (crop - calibration).abs() / crop.max(1.0)).max(0.0) * 0.1;
+            }
+            let key = p.key();
+            if let Some(entry) = found.iter_mut().find(|(_, q)| q.key() == key) {
+                if score > entry.0 {
+                    *entry = (score, p);
+                }
+            } else {
+                found.push((score, p));
+            }
+        }
+        found.sort_by(|(a, pa), (b, pb)| b.total_cmp(a).then_with(|| pa.display_name().cmp(&pb.display_name())));
+        found.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// Every lens for `camera`'s mount, once per [`Profile::key`], sorted by name: the fallback when
+    /// a file names no usable focal range and [`candidates`](Self::candidates) has nothing to
+    /// narrow with.
+    pub fn lenses_for_camera(&self, camera: &Camera) -> Vec<&Profile> {
+        let mut found: Vec<&Profile> = Vec::new();
+        for profile in self
+            .lenses
+            .iter()
+            .filter(|p| camera.mount.is_empty() || p.mounts.is_empty() || p.mounts.iter().any(|m| m.eq_ignore_ascii_case(&camera.mount)))
+        {
+            if let Some(entry) = found.iter_mut().find(|q| q.key() == profile.key()) {
+                if crop_distance(profile.crop_factor, camera.crop_factor) < crop_distance(entry.crop_factor, camera.crop_factor) {
+                    *entry = profile;
+                }
+            } else {
+                found.push(profile);
+            }
+        }
+        found.sort_by_key(|p| p.display_name());
+        found
+    }
+
     fn best_lens(&self, lens_make: Option<&str>, lens_model: &str, camera: Option<&Camera>, eligible: impl Fn(&Profile) -> bool) -> Option<&Profile> {
         let exif = tokens(lens_model);
         if exif.is_empty() {
@@ -340,6 +445,74 @@ fn is_number(t: &str) -> bool {
     t.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// What a lens name says about its optics: "18-200mm f/3.5-6.3" → 18..200 mm at f/3.5..6.3.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NameSpec {
+    focal: (f64, f64),
+    aperture: Option<(f64, f64)>,
+}
+
+/// Read the focal and aperture ranges from a lens name, using the same token rules as matching
+/// ("24-105mm" → 24, 105, mm; "f/2.8" → f, 2.8). A name without a usable focal range has no spec.
+fn spec_from_name(name: &str) -> Option<NameSpec> {
+    let tokens = tokens(name);
+    let mm = tokens.iter().position(|t| t == "mm")?;
+    // The focal numbers are the run immediately before "mm" (words before it, and anything after a
+    // gap, are model names or version codes: "1.4x 50mm" is a 50 mm lens).
+    let mut focal: Vec<f64> = Vec::new();
+    for token in tokens.get(..mm)?.iter().rev() {
+        let Ok(value) = token.parse::<f64>() else { break };
+        if value.is_finite() && value > 0.0 {
+            focal.push(value);
+            if focal.len() == 2 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    focal.reverse();
+    let (fmin, fmax) = match focal.as_slice() {
+        [] => return None,
+        [one] => (*one, *one),
+        [first, second, ..] => (*first, *second),
+    };
+    let aperture = tokens.get(mm + 1..).and_then(|after| {
+        let f = after.iter().position(|t| t == "f")?;
+        // Likewise the aperture numbers stop at the first word: "f/2.8 Di VC USD" is f/2.8, and
+        // "f/3.5-6.3 XR" is f/3.5-6.3, never the version numbers later in the name.
+        let mut values: Vec<f64> = Vec::new();
+        for token in after.get(f + 1..)? {
+            let Ok(value) = token.parse::<f64>() else { break };
+            if value.is_finite() && value > 0.0 {
+                values.push(value);
+                if values.len() == 2 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        match values.as_slice() {
+            [] => None,
+            [one] => Some((*one, *one)),
+            [first, second, ..] => Some((*first, *second)),
+        }
+    });
+    Some(NameSpec { focal: (fmin.min(fmax), fmin.max(fmax)), aperture })
+}
+
+/// A stable identity for a lens name: the maker and its primary model. Lensfun may carry several
+/// calibrations (crop factors, aspect ratios) for one lens name; they share this key.
+fn profile_key(maker: &str, model: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in maker.bytes().chain(std::iter::once(0)).chain(model.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Makers match when one's first word appears in the other ("NIKON CORPORATION" / "Nikon").
 fn maker_matches(a: &[String], b: &[String]) -> bool {
     match (a.first(), b.first()) {
@@ -393,6 +566,18 @@ fn camera(n: &xml::Node) -> Option<Camera> {
 
 fn crop_of(s: Option<&str>) -> Option<f64> {
     s.and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && (0.05..=20.0).contains(v))
+}
+
+/// How far a calibration's crop factor is from the camera's, for choosing one of several
+/// calibrations of the same lens. A profile with a known crop factor beats one without when the
+/// camera's is known (and is neutral when neither is).
+fn crop_distance(calibration: Option<f64>, camera: Option<f64>) -> f64 {
+    match (calibration, camera) {
+        (Some(c), Some(cam)) => (c - cam).abs(),
+        (Some(_), None) => 0.5,
+        (None, Some(_)) => 1.0,
+        (None, None) => 0.0,
+    }
 }
 
 fn aspect_of(s: Option<&str>) -> Option<f64> {
@@ -524,6 +709,44 @@ pub fn spec_name(spec: [f64; 4]) -> String {
 }
 
 impl Profile {
+    /// A stable identity for this lens name (maker and primary model), shared by its calibrations.
+    pub fn key(&self) -> u64 {
+        profile_key(&self.maker, self.models.first().map(String::as_str).unwrap_or_default())
+    }
+
+    /// The name the picker and the Optics panel show: the maker once, then the model.
+    pub fn display_name(&self) -> String {
+        let model = self.models.first().map(String::as_str).unwrap_or_default();
+        if self.maker.is_empty() || model.to_lowercase().starts_with(&self.maker.to_lowercase()) {
+            model.to_string()
+        } else {
+            format!("{} {model}", self.maker)
+        }
+    }
+
+    /// The focal range the lens is made for, from its name (a calibration may only cover part of
+    /// the range), or from its calibration points when the name gives none.
+    pub fn focal_range(&self) -> Option<(f64, f64)> {
+        if let Some(range) = self.models.iter().find_map(|m| spec_from_name(m).map(|s| s.focal)) {
+            return Some(range);
+        }
+        let mut lo: f64 = f64::INFINITY;
+        let mut hi: f64 = 0.0;
+        for focal in self.distortion.iter().map(|d| d.0).chain(self.tca.iter().map(|t| t.0)).chain(self.vignetting.iter().map(|v| v.focal)) {
+            if focal.is_finite() && focal > 0.0 {
+                lo = lo.min(focal);
+                hi = hi.max(focal);
+            }
+        }
+        (hi > 0.0).then_some((lo, hi))
+    }
+
+    /// The aperture range the profile's name gives (f/3.5-6.3): the only reliable place for the
+    /// tele-end maximum, since lensfun's `<aperture max>` is the smallest aperture instead.
+    pub fn aperture_range(&self) -> Option<(f64, f64)> {
+        self.models.iter().find_map(|m| spec_from_name(m).and_then(|s| s.aperture))
+    }
+
     /// Whether one of the profile's names is exactly `name` (same words and numbers, ignoring case and
     /// punctuation): the check for names that carry no maker, such as [`spec_name`]s, where the best partial match
     /// could be another maker's lens with the same focal range. The maker's words count too, so "Samyang 85mm f/1.4"
