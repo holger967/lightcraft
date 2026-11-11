@@ -181,13 +181,37 @@ fn database_name(camera: &str, lens: &str) -> Option<String> {
     })
 }
 
+/// The profiles the Optics picker offers for `p`: narrowed to the camera's mount and the focal and
+/// aperture ranges the file's lens name gives, so an 18-200 f/3.5-6.3 file shows the 18-200
+/// f/3.5-6.3 lenses and not every lens or every 18-200. Falls back to the camera's mount when the
+/// file names no usable range; empty without a database.
+pub fn candidates(p: &lightcraft_catalog::Photo) -> Vec<(u64, String)> {
+    let Some(db) = lens_profiles::database() else { return Vec::new() };
+    lens_profiles::candidates_for(&db, p).into_iter().map(|profile| (profile.key(), profile.display_name())).collect()
+}
+
+/// The profile already applied to `p`, when a database profile is what corrects it: the manual
+/// choice or the automatic match.
+pub fn chosen(p: &lightcraft_catalog::Photo) -> Option<(u64, String)> {
+    let key = p.embedded_lens?.profile_key?;
+    let db = lens_profiles::database()?;
+    Some((key, lens_profiles::profile_display_name(&db, key)?))
+}
+
 /// What the Optics panel says about photo `p`'s lens profile: which one is loaded and from where, or why there is
 /// none.
 pub fn readout(app: &LightcraftApp, p: &lightcraft_catalog::Photo) -> String {
     use lightcraft_develop::LensSource;
-    match p.embedded_lens.map(|l| l.source) {
-        Some(LensSource::File) => crate::i18n::tr("Profile: from the file (the camera's own correction)").to_string(),
-        Some(LensSource::Database) => {
+    match p.embedded_lens {
+        Some(l) if l.source == LensSource::File => crate::i18n::tr("Profile: from the file (the camera's own correction)").to_string(),
+        Some(l) if l.source == LensSource::Manual => {
+            let name = l
+                .profile_key
+                .and_then(|key| lens_profiles::database().and_then(|db| lens_profiles::profile_display_name(&db, key)))
+                .unwrap_or_else(|| p.meta.lens.trim().to_string());
+            crate::i18n::tr_format!("Profile: {} (chosen)", name)
+        }
+        Some(_) => {
             let name = database_name(&p.meta.camera, &p.meta.lens).unwrap_or_else(|| p.meta.lens.trim().to_string());
             crate::i18n::tr_format!("Profile: {} (lens database)", name)
         }

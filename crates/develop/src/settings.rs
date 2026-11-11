@@ -727,10 +727,15 @@ impl Default for Optics {
 pub struct EmbeddedLens {
     pub warp: Option<EmbeddedWarp>,
     pub vignette: Option<EmbeddedVignette>,
-    /// Where the correction came from: the file itself, or a lens database looked up by the
-    /// lens named in the file (what the Optics panel says is loaded).
+    /// Where the correction came from: the file itself, a lens database looked up by the lens
+    /// named in the file, or a database profile the user chose (what the Optics panel says is loaded).
     #[serde(skip_serializing_if = "LensSource::is_file")]
     pub source: LensSource,
+    /// The database profile's stable key (the lens database's `Profile::key`), when the correction
+    /// came from a database profile: the Optics panel names it even when the file's lens name alone
+    /// would not find it (a manual choice), and a newer database keeps finding the same lens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_key: Option<u64>,
     /// A DNG 1.6 `WarpRectilinear2` chain (up to [`WARP_STAGES`] stages, in `OpcodeList3` order; each stage warps
     /// the result of the one before it). When any is set, `warp` is `None`: the chain holds every warp opcode.
     pub stages: [Option<EmbeddedWarpStage>; WARP_STAGES],
@@ -745,6 +750,9 @@ pub enum LensSource {
     File,
     /// A profile from a lensfun-format lens database, matched by the lens named in the file.
     Database,
+    /// A database profile the user chose by hand, for a file whose metadata does not identify the
+    /// lens (an old Nikon DSLR with a third-party lens, an adapted or manual lens).
+    Manual,
 }
 
 impl LensSource {

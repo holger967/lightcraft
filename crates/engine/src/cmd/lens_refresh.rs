@@ -14,7 +14,7 @@ use lightcraft_catalog::{Catalog, Op, Photo, PhotoId};
 use lightcraft_develop::LensSource;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, always, bad, cmd};
+use super::{CommandSpec, always, bad, cmd, has_selection};
 use crate::media::{FileProbe, ProbeInfo};
 use crate::{Result, Session};
 
@@ -110,6 +110,103 @@ pub fn apply(s: &mut Session, results: Vec<(Missing, std::result::Result<ProbeIn
     Ok(found)
 }
 
+/// The lens-identifying metadata a manual choice is remembered by: the camera and the lens name
+/// the file records. A photo with the same pair is the same lens on the same body.
+fn lens_signature(p: &Photo) -> (String, String) {
+    (p.meta.camera.trim().to_lowercase(), p.meta.lens.trim().to_lowercase())
+}
+
+/// Apply the database profile `profile` (a [`lightcraft_lensdb::Profile::key`]) to the target
+/// photos, or to every photo with the first target's camera and lens when `applyToMatching` is on.
+/// The correction is marked [`LensSource::Manual`](lightcraft_develop::LensSource::Manual), so a
+/// later database refresh leaves the user's choice alone, and "Enable Lens Corrections" is turned
+/// on where it was off. One undo step for the whole batch.
+fn choose(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "optics.chooseLensProfile";
+    let key = match p.get("profile") {
+        // a string keeps the 64-bit key exact in clients whose JSON numbers are doubles
+        Some(Value::String(text)) => text.parse::<u64>().map_err(|_| bad(C, "`profile` is a lens profile key"))?,
+        Some(value) => value.as_u64().ok_or_else(|| bad(C, "`profile` is a lens profile key"))?,
+        None => return Err(bad(C, "`profile` is a lens profile key")),
+    };
+    let apply_to_matching = match p.get("applyToMatching") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(on)) => *on,
+        Some(_) => return Err(bad(C, "`applyToMatching` is true or false")),
+    };
+    let db = crate::lens_profiles::database().ok_or_else(|| bad(C, "no lens database is loaded"))?;
+    let targets = s.targets(p).map_err(|e| bad(C, e.to_string()))?;
+    let applied = apply_choice(s, &db, key, targets, apply_to_matching)?;
+    Ok(json!({"profile": key.to_string(), "applied": applied.iter().map(|id| id.0).collect::<Vec<_>>()}))
+}
+
+/// The work behind [`choose`]: expand the targets to the same camera and lens when asked, resolve
+/// the profile on each photo's own frame, and commit the lens data and the switch as one step.
+pub(crate) fn apply_choice(
+    s: &mut Session,
+    db: &lightcraft_lensdb::LensDb,
+    key: u64,
+    mut targets: Vec<PhotoId>,
+    apply_to_matching: bool,
+) -> Result<Vec<PhotoId>> {
+    if apply_to_matching && let Some(first) = targets.first().and_then(|id| s.catalog.photo(*id)) {
+        let signature = lens_signature(first);
+        // an empty lens name is no identity: the choice stays on the photo the user picked
+        if !signature.1.is_empty() {
+            targets = s.catalog.photos().filter(|photo| lens_signature(photo) == signature).map(|photo| photo.id).collect();
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    let label = "Lens Profile";
+    let mut ops = Vec::new();
+    let mut applied = Vec::new();
+    for id in targets {
+        let Some(photo) = s.catalog.photo(id).cloned() else { continue };
+        // the file's own correction is part of the file and wins (the Optics panel hides the picker for it)
+        if photo.embedded_lens.is_some_and(|l| l.source == LensSource::File) {
+            continue;
+        }
+        let Some(lens) = crate::lens_profiles::manual(db, key, &photo) else { continue };
+        ops.push(Op::SetEmbeddedLens { id, lens: Some(Box::new(lens)) });
+        if !photo.develop.optics.lens_profile {
+            let mut settings = (*photo.develop).clone();
+            settings.optics.lens_profile = true;
+            let settings = s.fit_constrained_crop(id, settings);
+            if let Some(op) = s.develop_op(id, settings, label) {
+                ops.push(op);
+            }
+        }
+        applied.push(id);
+    }
+    if applied.is_empty() {
+        return Err(bad(
+            "optics.chooseLensProfile",
+            "no selected photo can take this profile (its file carries its own correction, or the profile has none for the frame)",
+        ));
+    }
+    let op = if ops.len() == 1 { ops.remove(0) } else { Op::Batch { ops } };
+    s.commit(label, op)?;
+    for id in &applied {
+        s.media.forget(*id);
+    }
+    Ok(applied)
+}
+
+/// The candidate list the Optics picker shows, for agents too: the camera's mount and the focal
+/// and aperture ranges the photo's lens name gives, or the mount's lenses when the name gives no
+/// usable range.
+fn candidates_for(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "optics.lensCandidates";
+    let db = crate::lens_profiles::database().ok_or_else(|| bad(C, "no lens database is loaded"))?;
+    let id = s.targets(p).map_err(|e| bad(C, e.to_string()))?.into_iter().next().ok_or_else(|| bad(C, "no photo selected"))?;
+    let photo = s.catalog.photo(id).ok_or_else(|| bad(C, "no such photo"))?;
+    let listed = crate::lens_profiles::candidates_for(&db, photo);
+    Ok(json!({
+        "candidates": listed.iter().map(|profile| json!({"key": profile.key().to_string(), "name": profile.display_name()})).collect::<Vec<_>>()
+    }))
+}
+
 /// Why a photo has no lens profile, in words for the Optics panel: `None` when it has one.
 pub fn no_profile_reason(p: &Photo) -> Option<String> {
     if p.embedded_lens.is_some() {
@@ -181,6 +278,30 @@ fn status(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        CommandSpec {
+            explicit_targets: true,
+            ..cmd!(
+                query "optics.lensCandidates",
+                "Lens Profile Candidates",
+                [],
+                None,
+                "{ids?: [photo ids]} — the lens database profiles the Optics picker would offer for the first target: the camera's mount and the focal and aperture ranges in the file's lens name, or the mount's lenses when the name gives no range → {candidates: [{key (a string), name}]}",
+                has_selection,
+                candidates_for
+            )
+        },
+        CommandSpec {
+            explicit_targets: true,
+            ..cmd!(
+                "optics.chooseLensProfile",
+                "Choose Lens Profile",
+                [],
+                None,
+                "{profile: lens profile key (the string from optics.lensCandidates), applyToMatching?: bool, ids?: [photo ids]} — apply a lens database profile to the selected photos (or `ids`), marking it as the user's choice so a database refresh leaves it alone and switching Enable Lens Corrections on; with applyToMatching, every photo with the first target's camera and lens name gets it too, as one undo step → {profile (a string), applied: [ids]}",
+                has_selection,
+                choose
+            )
+        },
         cmd!(
             "library.refreshLensProfiles",
             "Look Up Lens Profiles Again",

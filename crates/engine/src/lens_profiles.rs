@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use lightcraft_develop::{EmbeddedLens, LensSource};
-use lightcraft_lensdb::{LensDb, Shot};
+use lightcraft_lensdb::{Camera, LensDb, Profile, Shot};
 
 /// The environment variable naming the lens database directory.
 pub const ENV: &str = "LIGHTCRAFT_LENSFUN_DIR";
@@ -147,19 +147,75 @@ fn summary(dir: &Path, whose: &str, db: &LensDb) -> (log::Level, String) {
     }
 }
 
+/// The camera a library record names: `camera` is the make and model as the library shows them
+/// ("Nikon D5000"), and `make` is Exif `Make` when the record has it.
+pub fn camera_of<'a>(db: &'a LensDb, camera: &str, make: &str) -> Option<&'a Camera> {
+    let make = make.trim();
+    let model = camera.strip_prefix(make).map(str::trim).unwrap_or(camera);
+    // The library's camera is the maker and model together ("NIKON CORPORATION NIKON D5000"), and
+    // Exif's make may be several words: strip the whole make before looking the model up.
+    if let Some(found) = db.find_camera(make, model) {
+        return Some(found);
+    }
+    let (maker, model) = camera.split_once(' ').unwrap_or(("", camera));
+    if let Some(found) = db.find_camera(maker, model).or_else(|| db.find_camera(make, camera)) {
+        return Some(found);
+    }
+    // A catalog from another app may have no Exif make: try every split of "maker model", since a
+    // maker can be more than one word.
+    let words: Vec<&str> = camera.split_whitespace().collect();
+    (1..words.len()).find_map(|i| db.find_camera(&words[..i].join(" "), &words[i..].join(" ")))
+}
+
 /// The database's name for the lens a photo's file calls `lens` (taken with `camera`, the make and model as the
 /// library shows them): "Canon EF 70-200mm f/2.8L IS II USM". `None` without a database or a match.
 pub fn profile_name(db: &LensDb, camera: &str, lens: &str) -> Option<String> {
-    let cam = camera.split_once(' ').and_then(|(make, model)| db.find_camera(make, model).or_else(|| db.find_camera(make, camera)));
-    let p = db.find_lens(None, lens, cam)?;
-    let model = p.models.first()?;
-    Some(if model.to_lowercase().starts_with(&p.maker.to_lowercase()) || p.maker.is_empty() { model.clone() } else { format!("{} {model}", p.maker) })
+    let p = db.find_lens(None, lens, camera_of(db, camera, ""))?;
+    Some(p.display_name())
+}
+
+/// The database's name for the profile under `key`, for the Optics panel when the file's own lens
+/// name would not find it (a manual choice).
+pub fn profile_display_name(db: &LensDb, key: u64) -> Option<String> {
+    db.profile_by_key(key).map(|p| p.display_name())
+}
+
+/// The profiles the Optics picker offers for `photo`: narrowed by the camera's mount and the focal
+/// and aperture ranges in the file's lens name, or the mount's lenses when the name gives no usable
+/// range. Shared by the app and the `optics.lensCandidates` command so they list the same profiles.
+pub fn candidates_for<'a>(db: &'a LensDb, photo: &lightcraft_catalog::Photo) -> Vec<&'a Profile> {
+    let camera = camera_of(db, &photo.meta.camera, &photo.meta.make);
+    let maker = (!photo.meta.lens_make.is_empty()).then_some(photo.meta.lens_make.as_str());
+    let mut listed = db.candidates(camera, &photo.meta.lens, maker);
+    if listed.is_empty()
+        && let Some(camera) = camera
+    {
+        listed = db.lenses_for_camera(camera);
+    }
+    listed
+}
+
+/// Convert `profile`'s calibration for a photo with metadata `m`, for its `w × h` (unoriented,
+/// default-cropped) image, re-expressed after `orientation`.
+fn corrected(
+    profile: &Profile,
+    source: LensSource,
+    camera: Option<&Camera>,
+    m: &lightcraft_meta::Metadata,
+    w: f64,
+    h: f64,
+    orientation: lightcraft_geom::Orientation,
+) -> Option<EmbeddedLens> {
+    let focal = m.focal_length.filter(|f| f.is_finite() && *f > 0.0)?;
+    let crop = frame_crop_factor(camera.and_then(|c| c.crop_factor), focal, m.focal_length_35mm);
+    let shot = Shot { focal, aperture: m.f_number, distance: None, crop_factor: crop, width: w, height: h };
+    let corr = profile.correction(&shot)?;
+    Some(EmbeddedLens { source, profile_key: Some(profile.key()), ..lightcraft_pipeline::optics::reorient_lens(&corr, orientation, w, h) })
 }
 
 /// The database profile for a photo with metadata `m`, for its `w × h` (unoriented, default-cropped) image,
 /// re-expressed after `orientation`. `None` without a database, lens name, focal length or matching profile.
 pub fn lookup(db: &LensDb, m: &lightcraft_meta::Metadata, w: f64, h: f64, orientation: lightcraft_geom::Orientation) -> Option<EmbeddedLens> {
-    let focal = m.focal_length.filter(|f| f.is_finite() && *f > 0.0)?;
     let camera = db.find_camera(m.make.as_deref().unwrap_or_default(), m.model.as_deref().unwrap_or_default());
     let lens = match m.lens_model.as_deref() {
         Some(model) => db.find_lens(m.lens_make.as_deref(), model, camera)?,
@@ -170,10 +226,30 @@ pub fn lookup(db: &LensDb, m: &lightcraft_meta::Metadata, w: f64, h: f64, orient
             db.find_lens_named(m.lens_make.as_deref(), &name, camera)?
         }
     };
-    let crop = frame_crop_factor(camera.and_then(|c| c.crop_factor), focal, m.focal_length_35mm);
-    let shot = Shot { focal, aperture: m.f_number, distance: None, crop_factor: crop, width: w, height: h };
-    let corr = lens.correction(&shot)?;
-    Some(EmbeddedLens { source: LensSource::Database, ..lightcraft_pipeline::optics::reorient_lens(&corr, orientation, w, h) })
+    corrected(lens, LensSource::Database, camera, m, w, h, orientation)
+}
+
+/// The correction from the database profile `key` the user chose for `photo`: the profile's
+/// calibration nearest the camera's crop factor, on the photo's own dimensions (the pipeline
+/// applies the user's rotation afterwards). `None` without the profile, focal length or a
+/// correction for that frame.
+pub fn manual(db: &LensDb, key: u64, photo: &lightcraft_catalog::Photo) -> Option<EmbeddedLens> {
+    let camera = camera_of(db, &photo.meta.camera, &photo.meta.make);
+    let profile = db.profile_for_camera(key, camera)?;
+    // `Photo::width`/`height` are the EXIF-oriented source the stored corrections are relative to;
+    // the pipeline applies the user's own rotation (`DevelopSettings::orientation`) afterwards
+    // ([`lightcraft_pipeline::geometry::Frame::with_lens`]), so this one is not rotated here.
+    let (w, h) = (f64::from(photo.width.max(1)), f64::from(photo.height.max(1)));
+    let m = lightcraft_meta::Metadata {
+        make: Some(photo.meta.make.clone()),
+        model: Some(photo.meta.camera.clone()),
+        lens_make: (!photo.meta.lens_make.is_empty()).then(|| photo.meta.lens_make.clone()),
+        lens_model: (!photo.meta.lens.is_empty()).then(|| photo.meta.lens.clone()),
+        focal_length: photo.meta.focal_mm.map(f64::from),
+        f_number: photo.meta.aperture.map(f64::from),
+        ..Default::default()
+    };
+    corrected(profile, LensSource::Manual, camera, &m, w, h, lightcraft_geom::Orientation::Normal)
 }
 
 /// The crop factor of the recorded frame, which scales the profile's radii: the body's (`camera`), else what the
@@ -223,6 +299,16 @@ mod tests {
         }
     }
 
+    /// The library shows the maker and model together, and Exif's make can be several words
+    /// ("NIKON CORPORATION NIKON D5000"): the whole make is stripped before the model lookup.
+    #[test]
+    fn a_multi_word_make_is_stripped_before_the_camera_lookup() {
+        let db = LensDb::parse(DB).unwrap();
+        assert_eq!(camera_of(&db, "Testcam Corporation TC-1", "Testcam Corporation").map(|c| c.model.as_str()), Some("TC-1"));
+        assert_eq!(camera_of(&db, "Testcam TC-1", "Testcam Corporation").map(|c| c.model.as_str()), Some("TC-1"));
+        assert_eq!(camera_of(&db, "Testcam Corporation TC-1", "").map(|c| c.model.as_str()), Some("TC-1"), "no Exif make");
+    }
+
     /// The log says where the database was read from and what it holds, and warns when it holds no lenses (#2511).
     #[test]
     fn the_log_names_the_folder_and_what_it_holds() {
@@ -241,6 +327,7 @@ mod tests {
         let lens = lookup(&db, &meta(), 6000.0, 4000.0, Orientation::Normal).unwrap();
         assert!(lens.warp.is_some() && lens.vignette.is_some());
         assert_eq!(lens.source, LensSource::Database, "the Optics panel says where it came from");
+        assert_eq!(lens.profile_key, Some(db.lenses[0].key()), "the panel can name the exact profile");
         assert_eq!(profile_name(&db, "Testcam TC-1", "18-55mm F3.5-5.6").as_deref(), Some("Testcam 18-55mm f/3.5-5.6"));
         assert_eq!(profile_name(&db, "Testcam TC-1", "70-200mm F4"), None);
         let rotated = lookup(&db, &meta(), 6000.0, 4000.0, Orientation::Rotate90).unwrap();
@@ -300,7 +387,7 @@ mod tests {
         };
         let at = |crop: f64, w: f64, h: f64| {
             let shot = Shot { focal: 70.0, aperture: Some(2.8), distance: None, crop_factor: Some(crop), width: w, height: h };
-            EmbeddedLens { source: LensSource::Database, ..db.lenses[0].correction(&shot).unwrap() }
+            EmbeddedLens { source: LensSource::Database, profile_key: Some(db.lenses[0].key()), ..db.lenses[0].correction(&shot).unwrap() }
         };
         let aps_c = lookup(&db, &m(Some(105.0)), 5616.0, 3744.0, Orientation::Normal).unwrap();
         assert_eq!(aps_c, at(1.5, 5616.0, 3744.0));
@@ -330,15 +417,52 @@ mod tests {
             let m = lightcraft_meta::Metadata { focal_length_35mm: Some(17.1), ..meta() };
             let expected = db.lenses[0]
                 .correction(&Shot { focal: 18.0, aperture: Some(3.5), distance: None, crop_factor: Some(17.1 / 18.0), width: 6000.0, height: 4000.0 })
-                .map(|lens| EmbeddedLens { source: LensSource::Database, ..lens })
+                .map(|lens| EmbeddedLens { source: LensSource::Database, profile_key: Some(db.lenses[0].key()), ..lens })
                 .unwrap();
             assert_eq!(lookup(&db, &m, 6000.0, 4000.0, Orientation::Normal).unwrap(), expected, "{crop}");
             let fallback = db.lenses[0]
                 .correction(&Shot { focal: 18.0, aperture: Some(3.5), distance: None, crop_factor: None, width: 6000.0, height: 4000.0 })
-                .map(|lens| EmbeddedLens { source: LensSource::Database, ..lens })
+                .map(|lens| EmbeddedLens { source: LensSource::Database, profile_key: Some(db.lenses[0].key()), ..lens })
                 .unwrap();
             assert_eq!(lookup(&db, &meta(), 6000.0, 4000.0, Orientation::Normal).unwrap(), fallback, "no equivalent: {crop}");
         }
+    }
+
+    /// The library's combined "maker model" string still finds the camera, and the picker narrows by the
+    /// file's lens name.
+    #[test]
+    fn candidates_for_a_library_photo_strip_the_full_make() {
+        use lightcraft_catalog::{Photo, PhotoId, Source};
+        let db = LensDb::parse(DB).unwrap();
+        let mut photo = Photo::new(PhotoId(1), Source::File { path: "x.nef".into() }, "x.nef", "NEF", 6000, 4000, "2026-01-01");
+        photo.meta.make = "Testcam Corporation".into();
+        photo.meta.camera = "Testcam Corporation TC-1".into();
+        photo.meta.lens = "18-55mm F3.5-5.6".into();
+        let names: Vec<String> = candidates_for(&db, &photo).iter().map(|p| p.display_name()).collect();
+        assert!(names.iter().any(|n| n.contains("18-55mm f/3.5-5.6")), "{names:?}");
+    }
+
+    /// A manual choice applies the picked profile to the photo's own frame, marks it Manual, and records the key
+    /// so the Optics panel can name it after the database has changed.
+    #[test]
+    fn a_manual_choice_uses_the_picked_profile_and_records_its_key() {
+        use lightcraft_catalog::{Photo, PhotoId, Source};
+        let db = LensDb::parse(DB).unwrap();
+        let key = db.lenses[0].key();
+        let mut photo = Photo::new(PhotoId(1), Source::File { path: "x.nef".into() }, "x.nef", "NEF", 6000, 4000, "2026-01-01");
+        photo.meta.make = "Testcam".into();
+        photo.meta.camera = "Testcam TC-1".into();
+        photo.meta.lens = "18-55mm F3.5-5.6".into();
+        photo.meta.focal_mm = Some(18.0);
+        photo.meta.aperture = Some(3.5);
+        let lens = manual(&db, key, &photo).unwrap();
+        assert_eq!(lens.source, LensSource::Manual, "a chosen profile is not an automatic match");
+        assert_eq!(lens.profile_key, Some(key), "the panel names the chosen profile");
+        assert!(lens.warp.is_some() && lens.vignette.is_some());
+        assert_eq!(profile_display_name(&db, key).as_deref(), Some("Testcam 18-55mm f/3.5-5.6"));
+        // a frame with no focal length cannot be corrected
+        photo.meta.focal_mm = None;
+        assert!(manual(&db, key, &photo).is_none());
     }
 
     /// The database that was found is reported: how many files it holds and how many profiles they carry, so a

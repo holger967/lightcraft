@@ -408,7 +408,7 @@ pub fn reorient_lens(lens: &EmbeddedLens, o: Orientation, w: f64, h: f64) -> Emb
             EmbeddedWarpStage { planes, center: map_pt(st.center), radius: st.radius * long_ratio, reciprocal: st.reciprocal }
         })
     });
-    EmbeddedLens { warp, vignette, stages, source: lens.source }
+    EmbeddedLens { warp, vignette, stages, source: lens.source, profile_key: lens.profile_key }
 }
 
 // ------------------------------------------------------------------------------------------ lateral CA

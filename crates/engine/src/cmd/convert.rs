@@ -468,6 +468,7 @@ mod tests {
             vignette: None,
             stages: Default::default(),
             source: Default::default(),
+            profile_key: None,
         }
     }
     fn old_rw2() -> lightcraft_catalog::Photo {

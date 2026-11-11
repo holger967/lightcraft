@@ -242,7 +242,7 @@ pub(crate) fn pinned_lens(
 ) -> Option<lightcraft_develop::EmbeddedLens> {
     match decoded {
         Some(l) if l.source == lightcraft_develop::LensSource::File => Some(l),
-        _ => catalog.filter(|c| c.source == lightcraft_develop::LensSource::Database),
+        _ => catalog.filter(|c| c.source != lightcraft_develop::LensSource::File),
     }
 }
 

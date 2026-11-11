@@ -368,6 +368,9 @@ pub struct UiState {
     /// Photos to look up for a lens profile on the next frame (Enable Lens Corrections ticked without one).
     #[serde(skip)]
     pub lens_lookup_ids: Vec<lightcraft_catalog::PhotoId>,
+    /// A lens profile picked in Optics also goes on the other photos with the same camera and lens name.
+    #[serde(default = "default_true")]
+    pub lens_apply_matching: bool,
     #[serde(skip)]
     pub status: String,
     #[serde(skip)]
@@ -381,6 +384,10 @@ pub struct UiState {
     /// The Print dialog's page, selection and drag.
     #[serde(skip)]
     pub print: crate::print_view::PrintUi,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for UiState {
@@ -528,6 +535,7 @@ impl Default for UiState {
             lens_download_checked: false,
             lens_refreshed: None,
             lens_lookup_ids: Vec::new(),
+            lens_apply_matching: true,
             status: String::new(),
             dialog: None,
             print: Default::default(),

@@ -336,11 +336,47 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                     app.ui.lens_lookup_ids.extend(without);
                 }
             }
-            if lp && let Some(p) = app.session.catalog.photo(id).cloned() {
-                let text = crate::lens_db::readout(app, &p);
-                if !text.is_empty() {
-                    let r = ui.label(egui::RichText::new(text).size(11.0).color(Tokens::get(ui.ctx()).text_dim));
-                    crate::widgets::register(ui, "optics:lensProfile", r.rect);
+            if let Some(p) = app.session.catalog.photo(id).cloned() {
+                if lp {
+                    let text = crate::lens_db::readout(app, &p);
+                    if !text.is_empty() {
+                        let r = ui.label(egui::RichText::new(text).size(11.0).color(Tokens::get(ui.ctx()).text_dim));
+                        crate::widgets::register(ui, "optics:lensProfile", r.rect);
+                    }
+                }
+                // A file that carries its own correction needs no picker; a database match or a
+                // missing one can be replaced by a profile the user chooses from the candidates.
+                // The picker stays visible with the switch off: choosing one turns it on.
+                if p.develops_raw() && p.embedded_lens.is_none_or(|l| l.source != lightcraft_develop::LensSource::File) {
+                    let candidates = crate::lens_db::candidates(&p);
+                    let chosen = crate::lens_db::chosen(&p);
+                    ui.label(egui::RichText::new(crate::i18n::tr("Lens profile")).size(11.0).color(Tokens::get(ui.ctx()).text_dim));
+                    let selected = chosen.as_ref().map_or_else(|| crate::i18n::tr("Choose a profile…"), |(_, name)| name.as_str());
+                    let combo = crate::widgets::combo_box(("optics:lensProfile.picker", id))
+                        .selected_text(selected)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            if candidates.is_empty() {
+                                ui.label(crate::i18n::tr("No lens candidates for this file."));
+                            }
+                            for (key, name) in &candidates {
+                                if ui.selectable_label(chosen.as_ref().is_some_and(|(k, _)| k == key), name).clicked() {
+                                    let apply = app.ui.lens_apply_matching;
+                                    let params = json!({"profile": key.to_string(), "applyToMatching": apply, "ids": [id.0]});
+                                    match app.run("optics.chooseLensProfile", params) {
+                                        Ok(_) => app.toast(ui.ctx(), crate::i18n::tr_format!("Lens profile: {}", name)),
+                                        Err(e) => app.toast(ui.ctx(), e.to_string()),
+                                    }
+                                }
+                            }
+                        });
+                    crate::widgets::name_combo(&combo.response, crate::i18n::tr("Lens profile"));
+                    if !p.meta.lens.trim().is_empty() {
+                        let mut apply = app.ui.lens_apply_matching;
+                        if ui.checkbox(&mut apply, crate::i18n::tr("Apply to all photos with this lens")).changed() {
+                            app.ui.lens_apply_matching = apply;
+                        }
+                    }
                 }
             }
         });

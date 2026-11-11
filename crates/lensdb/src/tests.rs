@@ -608,6 +608,105 @@ fn load_dir_refuses_a_fifo_without_blocking() {
     assert_eq!(errs.len(), 1, "{errs:?}");
 }
 
+/// A lens database with several 18-200s on the same mount, the case a manual picker must narrow:
+/// the right aperture range, not every 18-200, and not other mounts.
+const CANDIDATES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<lensdatabase version="2">
+  <camera><maker>Nikon</maker><model>Nikon D5000</model><mount>Nikon F AF</mount><cropfactor>1.523</cropfactor></camera>
+  <lens>
+    <maker>Tamron</maker>
+    <model>Tamron AF 18-200mm f/3.5-6.3 XR Di II LD Aspherical (IF) Macro</model>
+    <mount>Nikon F AF</mount><mount>Canon EF</mount>
+    <calibration cropfactor="1.53">
+      <distortion model="ptlens" focal="18" a="0.01" b="-0.02" c="0"/>
+      <distortion model="ptlens" focal="200" a="0" b="0.006" c="0"/>
+    </calibration>
+    <calibration cropfactor="1.6">
+      <distortion model="ptlens" focal="18" a="0.01" b="-0.02" c="0"/>
+      <distortion model="ptlens" focal="200" a="0" b="0.006" c="0"/>
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Nikon</maker>
+    <model>Nikon AF-S DX VR Zoom-Nikkor 18-200mm f/3.5-5.6G IF-ED</model>
+    <mount>Nikon F AF</mount>
+    <calibration>
+      <distortion model="ptlens" focal="18" a="0.02" b="-0.04" c="0"/>
+      <distortion model="ptlens" focal="200" a="0" b="0.004" c="0"/>
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Sigma</maker>
+    <model>Sigma 18-200mm f/3.5-6.3 DC</model>
+    <mount>Nikon F AF</mount>
+    <calibration>
+      <distortion model="ptlens" focal="18" a="0.02" b="-0.05" c="0"/>
+      <distortion model="ptlens" focal="200" a="0" b="0.007" c="0"/>
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Tamron</maker>
+    <model>Tamron 18-270mm f/3.5-6.3 Di II VC</model>
+    <mount>Nikon F AF</mount>
+    <calibration>
+      <distortion model="ptlens" focal="18" a="0.02" b="-0.05" c="0"/>
+      <distortion model="ptlens" focal="270" a="0" b="0.007" c="0"/>
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Canon</maker>
+    <model>Canon EF-S 18-200mm f/3.5-5.6 IS</model>
+    <mount>Canon EF-S</mount>
+    <calibration>
+      <distortion model="ptlens" focal="18" a="0.02" b="-0.05" c="0"/>
+      <distortion model="ptlens" focal="200" a="0" b="0.007" c="0"/>
+    </calibration>
+  </lens>
+</lensdatabase>"#;
+
+#[test]
+fn a_lens_name_gives_its_focal_and_aperture_ranges() {
+    assert_eq!(spec_from_name("Tamron AF 18-200mm f/3.5-6.3 XR Di II"), Some(NameSpec { focal: (18.0, 200.0), aperture: Some((3.5, 6.3)) }));
+    assert_eq!(spec_from_name("50mm f/1.8"), Some(NameSpec { focal: (50.0, 50.0), aperture: Some((1.8, 1.8)) }));
+    assert_eq!(spec_from_name("18-200mm"), Some(NameSpec { focal: (18.0, 200.0), aperture: None }));
+    // words and version numbers after the optical spec are not focal lengths or apertures
+    assert_eq!(spec_from_name("Tamron SP 70-200mm f/2.8 Di VC USD G2 A025"), Some(NameSpec { focal: (70.0, 200.0), aperture: Some((2.8, 2.8)) }));
+    assert_eq!(spec_from_name("1.4x 50mm f/1.8"), Some(NameSpec { focal: (50.0, 50.0), aperture: Some((1.8, 1.8)) }));
+    assert_eq!(spec_from_name("No numbers here"), None);
+}
+
+#[test]
+fn candidates_narrow_to_the_mount_and_the_files_focal_and_aperture_ranges() {
+    let db = LensDb::parse(CANDIDATES).unwrap();
+    let camera = db.find_camera("Nikon", "D5000").unwrap();
+    let names: Vec<String> = db.candidates(Some(camera), "18-200mm f/3.5-6.3", None).iter().map(|p| p.display_name()).collect();
+    assert!(names.iter().any(|n| n.starts_with("Tamron AF 18-200mm f/3.5-6.3")), "{names:?}");
+    assert!(names.iter().any(|n| n.starts_with("Sigma 18-200mm f/3.5-6.3")), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("5.6")), "a 5.6 lens is not the file's 6.3 lens: {names:?}");
+    assert!(!names.iter().any(|n| n.contains("18-270")), "a longer zoom is a different lens: {names:?}");
+    assert!(!names.iter().any(|n| n.contains("Canon")), "another mount is not a candidate: {names:?}");
+    assert_eq!(names.iter().filter(|n| n.starts_with("Tamron AF 18-200mm")).count(), 1, "one entry per lens name: {names:?}");
+}
+
+#[test]
+fn a_known_lens_maker_ranks_its_candidates_first() {
+    let db = LensDb::parse(CANDIDATES).unwrap();
+    let camera = db.find_camera("Nikon", "D5000").unwrap();
+    let names: Vec<String> = db.candidates(Some(camera), "18-200mm f/3.5-6.3", Some("Sigma")).iter().map(|p| p.display_name()).collect();
+    assert!(names.first().is_some_and(|n| n.starts_with("Sigma")), "{names:?}");
+}
+
+#[test]
+fn a_profile_key_finds_the_calibration_nearest_the_camera() {
+    let db = LensDb::parse(CANDIDATES).unwrap();
+    let camera = db.find_camera("Nikon", "D5000").unwrap();
+    let key = db.lenses[0].key();
+    assert_eq!(db.profile_by_key(key), Some(&db.lenses[0]), "the key is stable across the parse");
+    let aps_c = db.profile_for_camera(key, Some(camera)).unwrap();
+    assert_eq!(aps_c.crop_factor, Some(1.53), "the D5000's 1.523 crop picks the 1.53 calibration");
+    assert_ne!(db.lenses[0].key(), db.lenses[2].key(), "different lenses have different keys");
+}
+
 #[test]
 fn teleconverter_combo_does_not_inherit_base_profile() {
     // The database has only the bare 400 mm profile. A teleconverter combo is a
