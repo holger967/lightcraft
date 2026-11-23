@@ -1396,7 +1396,7 @@ dependencies = [
 [[package]]
 name = "craft-metadata"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=2be967ec515a687db6b0abe372d54243ccf124bd#2be967ec515a687db6b0abe372d54243ccf124bd"
+source = "git+https://github.com/holger967/craft-libs?rev=0a302babe51e537ebd3bc42d6cd44748b291451f#0a302babe51e537ebd3bc42d6cd44748b291451f"
 dependencies = [
  "brotli-decompressor 6.0.1",
  "chrono",
@@ -1474,7 +1474,7 @@ source = "git+https://github.com/storytold/craft-libs?rev=2be967ec515a687db6b0ab
 [[package]]
 name = "craft-tiff"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=2be967ec515a687db6b0abe372d54243ccf124bd#2be967ec515a687db6b0abe372d54243ccf124bd"
+source = "git+https://github.com/holger967/craft-libs?rev=0a302babe51e537ebd3bc42d6cd44748b291451f#0a302babe51e537ebd3bc42d6cd44748b291451f"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

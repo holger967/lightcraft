@@ -40,8 +40,13 @@ impl FocusPoint {
     }
     /// The box clipped to the frame and checked: `None` when it is not a usable box.
     pub fn sanitized(self) -> Option<FocusPoint> {
-        let craft_fp =
-            craft_metadata::FocusPoint { rect: crate::convert::rect_to_craft(self.rect), mode: self.mode, area: self.area, tracking: self.tracking };
+        let craft_fp = craft_metadata::FocusPoint {
+            rect: crate::convert::rect_to_craft(self.rect),
+            mode: self.mode,
+            area: self.area,
+            tracking: self.tracking,
+            af_point: None,
+        };
         craft_fp.sanitized().map(crate::convert::focus_from_craft)
     }
     /// Orient a normalized sensor-frame box to the upright photo's frame.
