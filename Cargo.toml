@@ -221,5 +221,5 @@ winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457
 
 # Nikon AF points and Lens ID come from this fork's craft-libs main (upstream: storytold/craft-libs#3122).
 [patch."https://github.com/storytold/craft-libs"]
-craft-metadata = { git = "https://github.com/holger967/craft-libs", rev = "0a302babe51e537ebd3bc42d6cd44748b291451f" }
-craft-tiff = { git = "https://github.com/holger967/craft-libs", rev = "0a302babe51e537ebd3bc42d6cd44748b291451f" }
+craft-metadata = { git = "https://github.com/holger967/craft-libs", rev = "58861912d855eb6dbc0a11b5d84d154a49e19bbf" }
+craft-tiff = { git = "https://github.com/holger967/craft-libs", rev = "58861912d855eb6dbc0a11b5d84d154a49e19bbf" }
