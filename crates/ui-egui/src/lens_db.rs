@@ -137,10 +137,16 @@ fn refresh(app: &mut LightcraftApp) {
     app.ui.lens_refreshed = Some(key);
     let Some(probe) = recheck::file_probe(&app.session) else { return };
     let Some(db) = lens_profiles::database() else { return };
-    let listed = lens_refresh::missing(&app.session.catalog, &db, ids.as_deref(), again);
+    // the raws named only by their lens's specification are read once per lens reader, not at every start
+    let spec_names = app.ui.settings.lens_names_read < lens_refresh::SPEC_NAME_READER;
+    let listed = lens_refresh::missing(&app.session.catalog, &db, ids.as_deref(), again, spec_names);
     if listed.is_empty() {
+        if spec_names && ids.is_none() {
+            app.ui.settings.lens_names_read = lens_refresh::SPEC_NAME_READER;
+        }
         return;
     }
+    let whole = spec_names && ids.is_none();
     let work = move || lens_refresh::probe(&probe, listed);
     let done = move |app: &mut LightcraftApp, ctx: &egui::Context, results| {
         // another library, or a database reloaded while the files were read (the probe may have used either): the
@@ -149,7 +155,12 @@ fn refresh(app: &mut LightcraftApp) {
             ctx.request_repaint();
             return;
         }
-        match lens_refresh::apply(&mut app.session, results) {
+        let applied = lens_refresh::apply(&mut app.session, results);
+        // every such raw was read and its result kept: a later start leaves them alone
+        if whole && applied.is_ok() {
+            app.ui.settings.lens_names_read = lens_refresh::SPEC_NAME_READER;
+        }
+        match applied {
             Ok(found) if found.len() == 1 => app.toast(ctx, crate::i18n::tr("1 photo got its lens profile")),
             Ok(found) if found.len() > 1 => app.toast(ctx, crate::i18n::tr_format!("{n} photos got their lens profile", n = found.len())),
             Ok(_) => {}

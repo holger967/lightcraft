@@ -18,6 +18,10 @@ use super::{CommandSpec, always, bad, cmd};
 use crate::media::{FileProbe, ProbeInfo};
 use crate::{Result, Session};
 
+/// The lens reader whose names the app has looked for in the raws known only by their lens's specification: raise it
+/// when the reader learns to name more lenses, so those raws are read once more.
+pub const SPEC_NAME_READER: u32 = 1;
+
 /// A photo to probe again, and its file when listed (a result for a photo moved meanwhile is dropped).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Missing {
@@ -29,8 +33,11 @@ pub struct Missing {
 /// copies follow the photo they were copied from). With `again` (the database's files were replaced, or an agent
 /// asked for every photo), also the raws whose profile came from the database (the new data may give another one, or
 /// none) and the raws whose file named no lens when they were imported (a newer LightCraft may read their lens).
-/// No file-system calls.
-pub fn missing(cat: &Catalog, db: &lightcraft_lensdb::LensDb, ids: Option<&[PhotoId]>, again: bool) -> Vec<Missing> {
+/// With `spec_names` (or `again`, or `ids`), also the raws whose lens is known only by its specification (a Nikon
+/// DSLR's): a newer reader may name it. A file that can't be named would be read at every start otherwise, so the app
+/// asks for these once per reader ([`SPEC_NAME_READER`]). No file-system calls.
+pub fn missing(cat: &Catalog, db: &lightcraft_lensdb::LensDb, ids: Option<&[PhotoId]>, again: bool, spec_names: bool) -> Vec<Missing> {
+    let spec_names = spec_names || again || ids.is_some();
     // a photo and its virtual copies list the photo once, in library order
     let mut seen = std::collections::HashSet::new();
     let from_database = |p: &Photo| p.embedded_lens.is_some_and(|l| l.source == LensSource::Database);
@@ -43,7 +50,9 @@ pub fn missing(cat: &Catalog, db: &lightcraft_lensdb::LensDb, ids: Option<&[Phot
             match &p.embedded_lens {
                 None if lens.is_empty() => again,
                 // a lens known only by its specification (a Nikon DSLR's): a newer reader may name it now
-                None => lightcraft_meta::is_lens_spec_name(lens) || crate::lens_profiles::profile_name(db, &p.meta.camera, lens).is_some(),
+                None => {
+                    (spec_names && lightcraft_meta::is_lens_spec_name(lens)) || crate::lens_profiles::profile_name(db, &p.meta.camera, lens).is_some()
+                }
                 Some(_) => again && from_database(p),
             }
         })
@@ -138,7 +147,7 @@ fn refresh(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(db) = crate::lens_profiles::database() else {
         return Ok(json!({"checked": 0, "found": [], "database": false}));
     };
-    let listed = missing(&s.catalog, &db, ids.as_deref(), again);
+    let listed = missing(&s.catalog, &db, ids.as_deref(), again, true);
     let n = listed.len();
     let found = apply(s, probe(&fp, listed))?;
     Ok(json!({"checked": n, "found": found.iter().map(|i| i.0).collect::<Vec<_>>(), "database": true}))
