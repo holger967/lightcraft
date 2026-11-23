@@ -289,3 +289,27 @@ fn the_downloaded_database_is_selected_and_read_only_when_whole() {
     lens_profiles::use_dir(before);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A Nikon DSLR raw imported when only its lens specification could be read is read again, and the lens's name
+/// the file gives now replaces the specification (a real name is never replaced by one).
+#[test]
+fn a_lens_known_only_by_its_specification_is_read_again_and_named() {
+    let mut s = Session::new();
+    for p in [raw(1, "18.0-200.0 mm f/3.5-6.3", false), raw(2, "300mm F4", false)] {
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    }
+    let db = lightcraft_lensdb::LensDb::parse(DB).unwrap();
+    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false);
+    assert_eq!(listed.iter().map(|m| m.id.0).collect::<Vec<_>>(), [1], "the specification, not an unknown name");
+    let named = |name: &str| {
+        let mut info = crate::media::ProbeInfo { embedded_lens: Some(lens(-0.01)), ..Default::default() };
+        info.meta.lens = name.into();
+        info
+    };
+    let results = listed.into_iter().map(|m| (m, Ok(named("Testcam 18-200mm f/3.5-6.3")))).collect();
+    assert_eq!(crate::cmd::lens_refresh::apply(&mut s, results).unwrap(), [PhotoId(1)]);
+    assert_eq!(s.catalog.photo(PhotoId(1)).unwrap().meta.lens, "Testcam 18-200mm f/3.5-6.3");
+    let again = crate::cmd::lens_refresh::Missing { id: PhotoId(1), path: "/photos/1.cr3".into() };
+    crate::cmd::lens_refresh::apply(&mut s, vec![(again, Ok(named("18.0-200.0 mm f/3.5-6.3")))]).unwrap();
+    assert_eq!(s.catalog.photo(PhotoId(1)).unwrap().meta.lens, "Testcam 18-200mm f/3.5-6.3", "a name stays");
+}
