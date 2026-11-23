@@ -42,7 +42,8 @@ pub fn missing(cat: &Catalog, db: &lightcraft_lensdb::LensDb, ids: Option<&[Phot
             let lens = p.meta.lens.trim();
             match &p.embedded_lens {
                 None if lens.is_empty() => again,
-                None => crate::lens_profiles::profile_name(db, &p.meta.camera, lens).is_some(),
+                // a lens known only by its specification (a Nikon DSLR's): a newer reader may name it now
+                None => lightcraft_meta::is_lens_spec_name(lens) || crate::lens_profiles::profile_name(db, &p.meta.camera, lens).is_some(),
                 Some(_) => again && from_database(p),
             }
         })
@@ -94,7 +95,9 @@ pub fn apply(s: &mut Session, results: Vec<(Missing, std::result::Result<ProbeIn
                 }
             }
             let named = info.meta.lens.trim();
-            if p.meta.lens.trim().is_empty() && !named.is_empty() {
+            let was = p.meta.lens.trim();
+            let renamed = lightcraft_meta::is_lens_spec_name(was) && !named.is_empty() && !lightcraft_meta::is_lens_spec_name(named);
+            if (was.is_empty() && !named.is_empty()) || renamed {
                 let mut meta = p.meta.clone();
                 meta.lens = named.to_string();
                 ops.push(Op::SetMeta { id, meta: Box::new(meta) });

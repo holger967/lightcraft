@@ -25,6 +25,7 @@ mod xmp;
 
 pub use craft_metadata::DateTime;
 pub use craft_metadata::cr3;
+pub use craft_metadata::is_lens_spec_name;
 pub use craft_metadata::{Embedded, jpeg_segments, png_chunks, webp_chunks};
 pub use craft_metadata::{Flash, Gps, RegionKind};
 pub use craft_metadata::{GpxError, Match, TrackPoint, Tracklog, parse_gpx};
