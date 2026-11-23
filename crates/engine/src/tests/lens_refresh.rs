@@ -126,9 +126,9 @@ fn photos_get_their_profile_when_the_database_arrives() {
         s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
     }
     let db = lightcraft_lensdb::LensDb::parse(DB).unwrap();
-    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false);
+    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false, false);
     assert_eq!(listed.iter().map(|m| m.id.0).collect::<Vec<_>>(), [1, 2], "only lenses the database knows");
-    assert_eq!(crate::cmd::lens_refresh::missing(&s.catalog, &db, Some(&[PhotoId(2)]), false).len(), 1, "or only the photos asked for");
+    assert_eq!(crate::cmd::lens_refresh::missing(&s.catalog, &db, Some(&[PhotoId(2)]), false, false).len(), 1, "or only the photos asked for");
     // what the files give when read again
     let results = listed.into_iter().map(|m| (m, Ok(crate::media::ProbeInfo { embedded_lens: Some(lens(-0.01)), ..Default::default() }))).collect();
     let found = crate::cmd::lens_refresh::apply(&mut s, results).unwrap();
@@ -181,8 +181,8 @@ fn a_replaced_database_looks_up_database_profiles_and_unnamed_photos_again() {
     }
     let db = lightcraft_lensdb::LensDb::parse(DB).unwrap();
     let ids = |v: Vec<crate::cmd::lens_refresh::Missing>| v.iter().map(|m| m.id.0).collect::<Vec<_>>();
-    assert!(crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false).is_empty(), "an ordinary start reads none of them");
-    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, true);
+    assert!(crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false, false).is_empty(), "an ordinary start reads none of them");
+    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, true, false);
     assert_eq!(ids(listed.clone()), [1, 3, 4], "database profiles and unnamed raws, never the file's own correction");
     // what the files give with the new database: 1 another profile, 3 its lens (now read) and a profile, 4 nothing
     let gives = |id: u64| match id {
@@ -299,8 +299,11 @@ fn a_lens_known_only_by_its_specification_is_read_again_and_named() {
         s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
     }
     let db = lightcraft_lensdb::LensDb::parse(DB).unwrap();
-    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false);
+    // an ordinary start leaves it alone (a file that can't be named would be read at every start)
+    assert!(crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false, false).is_empty());
+    let listed = crate::cmd::lens_refresh::missing(&s.catalog, &db, None, false, true);
     assert_eq!(listed.iter().map(|m| m.id.0).collect::<Vec<_>>(), [1], "the specification, not an unknown name");
+    assert_eq!(crate::cmd::lens_refresh::missing(&s.catalog, &db, Some(&[PhotoId(1)]), false, false).len(), 1, "or when asked for");
     let named = |name: &str| {
         let mut info = crate::media::ProbeInfo { embedded_lens: Some(lens(-0.01)), ..Default::default() };
         info.meta.lens = name.into();

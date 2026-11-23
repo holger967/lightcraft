@@ -211,6 +211,10 @@ pub struct AppSettings {
     /// Lightroom's scale, logarithmic, or even in mireds. Only where the thumb sits; the stored Kelvin is the same.
     #[serde(deserialize_with = "lenient")]
     pub temp_scale: lightcraft_develop::KelvinScale,
+    /// The lens reader (`lens_refresh::SPEC_NAME_READER`) whose names were last looked for in the raws known only by
+    /// their lens's specification: they are read once per reader, not at every start.
+    #[serde(default, deserialize_with = "lenient")]
+    pub lens_names_read: u32,
 }
 
 /// Where File ▸ Import Lightroom Catalog… puts a catalog (Settings ▸ General ▸ Library). Saved as
@@ -265,6 +269,7 @@ impl Default for AppSettings {
             lightroom_import: LightroomImport::Ask,
             lens_database: Default::default(),
             temp_scale: Default::default(),
+            lens_names_read: 0,
         }
     }
 }
