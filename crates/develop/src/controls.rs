@@ -144,7 +144,7 @@ impl ControlSpec {
     /// The Kelvin temperature's track on `scale`; `None` for every other control, or a range the scale can't
     /// span (Lightroom's needs its centre inside the range, the others a positive minimum).
     fn kelvin_track(&self, scale: KelvinScale) -> Option<KelvinTrack> {
-        if self.id != "wb.temp" || !(self.min < self.max) {
+        if self.id != "wb.temp" || self.min.partial_cmp(&self.max) != Some(std::cmp::Ordering::Less) {
             return None;
         }
         match scale {
@@ -180,7 +180,10 @@ pub enum KelvinScale {
 #[derive(Clone, Copy)]
 enum KelvinTrack {
     /// the track's centre and `ln` of its right half's span
-    Lightroom { centre: f64, right: f64 },
+    Lightroom {
+        centre: f64,
+        right: f64,
+    },
     Logarithmic,
     Mired,
 }
