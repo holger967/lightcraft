@@ -17,7 +17,7 @@ pub(crate) fn orientation_to_craft(o: Orientation) -> craft_metadata::Orientatio
 }
 
 pub(crate) fn focus_from_craft(f: craft_metadata::FocusPoint) -> FocusPoint {
-    FocusPoint { rect: rect_from_craft(f.rect), mode: f.mode, area: f.area, tracking: f.tracking }
+    FocusPoint { rect: rect_from_craft(f.rect), mode: f.mode, area: f.area, tracking: f.tracking, af_point: f.af_point }
 }
 
 pub(crate) fn focus_to_craft(f: &FocusPoint) -> craft_metadata::FocusPoint {
@@ -26,7 +26,7 @@ pub(crate) fn focus_to_craft(f: &FocusPoint) -> craft_metadata::FocusPoint {
         mode: f.mode.clone(),
         area: f.area.clone(),
         tracking: f.tracking.clone(),
-        af_point: None,
+        af_point: f.af_point.clone(),
     }
 }
 

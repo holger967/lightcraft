@@ -1,5 +1,6 @@
 use crate::{Orientation, Rect};
 pub use craft_metadata::focus::{HEADER_PREFIX, MAX_HEADER_BYTES, camera_supported, decoder_tag, synthetic_arw};
+pub use craft_metadata::nikon::synthetic_nef;
 
 pub struct HeaderRead {
     pub focus: Option<FocusPoint>,
@@ -27,6 +28,10 @@ pub struct FocusPoint {
     /// What the camera followed, when it says (`Animal Eye Tracking`, `Face tracking`, `Lock On AF`…).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracking: Option<String>,
+    /// The camera's named AF point when it records one from a fixed grid (a Nikon `C7`): drawn as the camera draws
+    /// its active point (a red rectangle) rather than as a focus frame. Absent for Sony.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub af_point: Option<String>,
 }
 
 impl FocusPoint {
@@ -45,7 +50,7 @@ impl FocusPoint {
             mode: self.mode,
             area: self.area,
             tracking: self.tracking,
-            af_point: None,
+            af_point: self.af_point,
         };
         craft_fp.sanitized().map(crate::convert::focus_from_craft)
     }
