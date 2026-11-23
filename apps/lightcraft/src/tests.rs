@@ -6,6 +6,7 @@ fn desktop_clear_color_stays_opaque_with_a_modal_open() {
         LightcraftApp::new(Session::new(), Services::default()),
         PrefsWriter::default(),
         None,
+        None,
         #[cfg(target_os = "macos")]
         None,
     );
@@ -604,6 +605,7 @@ fn on_exit_ends_the_process_on_macos() {
             app,
             PrefsWriter::default(),
             None,
+            None,
             #[cfg(target_os = "macos")]
             None,
         );
@@ -636,6 +638,7 @@ fn on_exit_removes_the_lock_owner_note() {
         let mut app = App(
             LightcraftApp::new(session, Services::default()),
             PrefsWriter::default(),
+            None,
             None,
             #[cfg(target_os = "macos")]
             None,

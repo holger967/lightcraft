@@ -660,3 +660,30 @@ fn a_thumbnail_is_cut_from_the_decoded_full_source() {
     let cached = s.media.get(p.id, SourceLevel::Thumb).unwrap();
     assert_eq!((cached.width, cached.height), (512, 341), "a thumbnail-sized source is kept, not the full source");
 }
+
+#[test]
+fn an_hdr_display_shows_the_renditions_blended_by_its_headroom() {
+    use lightcraft_pipeline::{DeepImage, DeepSamples, OutputSpace};
+    // SDR rendition: a white highlight and a mid grey; HDR rendition: the highlight 3 stops up
+    let sdr = lightcraft_raster::Rgba8 { width: 2, height: 1, data: vec![[255, 255, 255, 255], [118, 118, 118, 255]] };
+    let hdr = |v: Vec<f32>| DeepImage { width: 2, height: 1, space: OutputSpace::Srgb, samples: DeepSamples::F32(v) };
+    let shown = |weight: f32| {
+        let mut d = hdr(vec![8.0, 8.0, 8.0, 0.18, 0.18, 0.18]);
+        assert!(super::render::adapt_hdr(&sdr, &mut d, weight));
+        match d.samples {
+            DeepSamples::F32(v) => v,
+            DeepSamples::U16(_) => Vec::new(),
+        }
+    };
+    let (none, half, full) = (shown(0.0), shown(0.5), shown(1.0));
+    assert!((none[0] - 1.0).abs() < 1e-3, "no headroom: the SDR rendition ({none:?})");
+    assert!((full[0] - 8.0).abs() < 1e-3, "full headroom: the HDR rendition ({full:?})");
+    assert!(half[0] > 2.0 && half[0] < 4.0, "half the stops: about half way in stops, not in light ({half:?})");
+    assert!((half[3] - none[3]).abs() < 0.01, "tones the renditions share stay put ({half:?})");
+    // the weight is the display's stops over the edit's
+    let w = super::render::hdr_weight;
+    assert!(w(1.0, 8.0) == 0.0 && w(8.0, 8.0) == 1.0 && w(16.0, 8.0) == 1.0);
+    assert!(w(2.0, 8.0) > 0.3 && w(2.0, 8.0) < 0.4, "1 stop of 3");
+    let mut other = hdr(vec![1.0; 9]);
+    assert!(!super::render::adapt_hdr(&sdr, &mut other, 0.5), "renditions of different sizes aren't blended");
+}

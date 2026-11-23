@@ -131,6 +131,12 @@ pub trait ScreenTextures {
     fn show(&mut self, frame: &lightcraft_engine::media::ScreenFrame, id: Option<egui::TextureId>) -> Option<egui::TextureId>;
     /// Release `id` (and the texture it shows).
     fn free(&mut self, id: egui::TextureId);
+    /// Show `texels`, a view's HDR render, under `id` (one this returned before, updated in place)
+    /// or a new id; `None` when the window can't show values above SDR white.
+    fn show_hdr(&mut self, texels: &HdrTexels, id: Option<egui::TextureId>) -> Option<egui::TextureId> {
+        let _ = (texels, id);
+        None
+    }
     /// The pixels `frame` holds, read back from the GPU: only for a headless screenshot of a view
     /// that shows it ([`Renderer::cpu_textures`]). `None` when they can't be read (the view is
     /// then left out of the picture).
@@ -157,6 +163,61 @@ struct Finished {
     look: Option<(u64, bool)>,
     result: RenderResult,
     color: Option<Arc<egui::ColorImage>>,
+    /// An HDR view's float texture, also converted on the worker (a window-sized one is tens of ms).
+    hdr: Option<Arc<HdrTexels>>,
+}
+
+/// A view's HDR render as a float texture takes it: RGBA half floats, row by row, encoded with the
+/// sRGB curve continued above 1.0, as egui's shader takes texture values to be sRGB-encoded and
+/// decodes them (with the same curve) before writing a linear (scRGB / EDR) surface. SDR white is
+/// 1.0; negative and non-finite values become 0; alpha is 1.
+pub struct HdrTexels {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<u16>,
+}
+
+impl HdrTexels {
+    /// `deep`'s float samples (linear RGB, SDR white 1.0); `None` for other sample formats.
+    pub fn of(deep: &lightcraft_pipeline::DeepImage) -> Option<Self> {
+        let lightcraft_pipeline::DeepSamples::F32(v) = &deep.samples else { return None };
+        if v.len() != deep.width.saturating_mul(deep.height).saturating_mul(3) {
+            return None;
+        }
+        let one = f16_bits(1.0);
+        let data = v
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|p| [f16_bits(srgb_encode(p[0])), f16_bits(srgb_encode(p[1])), f16_bits(srgb_encode(p[2])), one])
+            .collect();
+        Some(Self { width: deep.width, height: deep.height, data })
+    }
+}
+
+/// The sRGB encoding of linear `v`, continued above 1.0 (0 for negative or non-finite).
+fn srgb_encode(v: f32) -> f32 {
+    if !v.is_finite() || v <= 0.0 {
+        0.0
+    } else if v < 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// `v` as an IEEE half float (rounded to nearest; too large: the largest half; tiny: 0).
+fn f16_bits(v: f32) -> u16 {
+    let v = v.clamp(0.0, 65504.0);
+    let bits = v.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    if exp <= 0 {
+        return 0;
+    }
+    let mant = bits & 0x7f_ffff;
+    // round to nearest: carrying out of the mantissa bumps the exponent, which is right
+    let half = ((exp as u32) << 10) + (mant >> 13) + ((mant >> 12) & 1);
+    half.min(0x7bff) as u16
 }
 
 /// Immutable identity captured when a request is submitted, not when its result is collected.
@@ -349,6 +410,10 @@ pub struct Renderer {
     /// screenshot reads it back ([`Self::cpu_textures`]) instead of finding no pixels (a white
     /// photo, review of PR #1065).
     native_frames: HashMap<Slot, lightcraft_engine::media::ScreenFrame>,
+    /// The display's HDR headroom (its peak over SDR white) when the window shows values above SDR
+    /// white: views of HDR edits are then rendered in float and shown through
+    /// [`ScreenTextures::show_hdr`].
+    hdr_headroom: Option<f32>,
 }
 
 /// How many [`Slot::QuickAhead`] stand-ins the loupe keeps ready.
@@ -444,6 +509,7 @@ impl Renderer {
             screen: None,
             natives: HashMap::new(),
             native_frames: HashMap::new(),
+            hdr_headroom: None,
         }
     }
 }
@@ -609,8 +675,78 @@ impl Renderer {
             return job;
         }
         let job = job.with_display(self.display.clone());
+        // an HDR edit on an HDR display: rendered in float, its highlights shown
+        let job = if matches!(slot, Slot::Main | Slot::Region) && self.screen.is_some() { job.with_hdr_display(self.hdr_headroom) } else { job };
         // a drag's drafts are only drawn: they may stay on the GPU when the window can show them
-        if self.screen.is_some() && job.request.quality == lightcraft_pipeline::Quality::Draft { job.on_screen() } else { job }
+        if self.screen.is_some()
+            && job.request.quality == lightcraft_pipeline::Quality::Draft
+            && job.request.depth == lightcraft_pipeline::OutputDepth::U8
+        {
+            job.on_screen()
+        } else {
+            job
+        }
+    }
+
+    /// The display's HDR headroom from now on (`None` or 1.0: SDR). Kept to a quarter stop, so the
+    /// display's reported peak wobbling doesn't render the view again.
+    pub fn set_hdr_headroom(&mut self, headroom: Option<f32>) {
+        self.hdr_headroom = headroom.filter(|h| h.is_finite() && *h > 1.0).map(|h| ((h.log2() * 4.0).round() / 4.0).exp2()).filter(|h| *h > 1.0);
+    }
+
+    /// The display's HDR headroom HDR edits are shown with (`None`: they show their SDR rendition).
+    /// The app logs its changes (`hdr_display::DisplayRange`).
+    pub fn hdr_headroom(&self) -> Option<f32> {
+        self.hdr_headroom
+    }
+
+    /// Show a view's HDR render (`rendered.deep`, as `hdr` when the worker converted it) in `slot`;
+    /// whether it could be. A headless screenshot shows its SDR rendition (`color`, the 8-bit image).
+    #[allow(clippy::too_many_arguments)]
+    fn show_hdr(
+        &mut self,
+        ctx: &egui::Context,
+        slot: Slot,
+        r: &RenderResult,
+        hdr: Option<Arc<HdrTexels>>,
+        color: Option<Arc<egui::ColorImage>>,
+        look: Option<(u64, bool)>,
+        ms: f64,
+    ) -> bool {
+        let Ok(rendered) = r.rendered.as_ref() else { return false };
+        let Some(deep) = rendered.deep.as_ref().filter(|_| slot.is_view()) else { return false };
+        // (results that skipped the pool's workers: converted here)
+        let Some(texels) = hdr.or_else(|| HdrTexels::of(deep).map(Arc::new)) else { return false };
+        let shown = self.screen.as_mut().and_then(|s| s.show_hdr(&texels, self.natives.get(&slot).copied()));
+        let Some(id) = shown else { return false };
+        self.failed.remove(&slot);
+        self.natives.insert(slot, id);
+        self.native_frames.remove(&slot);
+        let pixels = self.keep_pixels.then(|| color.unwrap_or_else(|| Arc::new(color_image(&rendered.image))));
+        let (size, histogram) = ([deep.width, deep.height], rendered.histogram.clone());
+        match self.textures.get_mut(&slot) {
+            Some(t) => {
+                t.show_native(id);
+                t.look = look;
+                t.key = r.key;
+                t.photo = r.photo;
+                t.size = size;
+                t.histogram = Some(histogram);
+                t.ms = ms;
+                t.quick = None;
+                t.pixels = pixels;
+            }
+            None => {
+                let blank = egui::ColorImage::filled([1, 1], egui::Color32::BLACK);
+                let tex = ctx.load_texture(format!("{slot:?}"), blank, egui::TextureOptions::LINEAR);
+                let t = Tex { look, key: r.key, photo: r.photo, tex, size, histogram: Some(histogram), ms, quick: None, pixels, native: Some(id) };
+                self.textures.insert(slot, t);
+            }
+        }
+        if slot == Slot::Main {
+            self.last_main_ms = ms;
+        }
+        true
     }
 
     /// Show GPU-resident renders through `screen` from now on (the desktop app, once its GPU
@@ -650,7 +786,8 @@ impl Renderer {
             lightcraft_engine::display::present(&mut r, d);
         }
         let color = r.rendered.as_ref().ok().map(|x| Arc::new(color_image(&x.image)));
-        Finished { look: None, result: r, color }
+        let hdr = r.rendered.as_ref().ok().and_then(|x| x.deep.as_ref()).and_then(HdrTexels::of).map(Arc::new);
+        Finished { look: None, result: r, color, hdr }
     }
 
     fn request_needed(&self, slot: Slot, key: u64, priority: u32) -> bool {
@@ -927,7 +1064,7 @@ impl Renderer {
             slot,
             key,
             priority,
-            Box::new(move || Finished { look: None, result: lightcraft_engine::memory::in_background(|| job.run()), color: None }),
+            Box::new(move || Finished { look: None, result: lightcraft_engine::memory::in_background(|| job.run()), color: None, hdr: None }),
         );
     }
 
@@ -1250,17 +1387,16 @@ impl Renderer {
         }
     }
 
-    /// The jobs the pool and the offload finished: (slot, result, texture pixels, look, ms).
-    #[allow(clippy::type_complexity)]
-    fn take_finished(&mut self, inline_ms: f64) -> Vec<(Slot, RenderResult, Option<Arc<egui::ColorImage>>, Option<(u64, bool)>, f64)> {
+    /// The jobs the pool and the offload finished: (slot, finished, ms).
+    fn take_finished(&mut self, inline_ms: f64) -> Vec<(Slot, Finished, f64)> {
         let mut finished = Vec::new();
         while let Some(done) = self.pool.try_recv() {
-            finished.push((done.slot, done.result.result, done.result.color, done.result.look, if done.ms > 0.0 { done.ms } else { inline_ms }));
+            finished.push((done.slot, done.result, if done.ms > 0.0 { done.ms } else { inline_ms }));
         }
         if let Some(off) = self.offload.as_mut() {
             finished.extend(off.finished().into_iter().map(|(slot, r, ms)| {
                 let look = self.offload_looks.remove(&r.request_id);
-                (slot, r, None, look, ms)
+                (slot, Finished { look, result: r, color: None, hdr: None }, ms)
             }));
         }
         finished
@@ -1354,7 +1490,7 @@ impl Renderer {
         let finished = self.take_finished(inline_ms);
         self.dispatch();
         let mut changed = false;
-        for (mut slot, mut r, mut color, completed_look, ms) in finished {
+        for (mut slot, Finished { look: completed_look, result: mut r, mut color, hdr }, ms) in finished {
             self.completed += 1;
             // made for another display profile than the one in use: obsolete
             if r.display.is_some_and(|id| Some(id) != self.display_id()) {
@@ -1402,6 +1538,11 @@ impl Renderer {
             // a render that stayed on the GPU: drawn from its texture
             if r.frame.is_some() && r.rendered.is_ok() {
                 changed |= self.show_frame(ctx, slot, &r, look, ms);
+                continue;
+            }
+            // an HDR render of a view: drawn from a float texture (else its 8-bit image, below)
+            if r.rendered.as_ref().is_ok_and(|x| x.deep.is_some()) && self.show_hdr(ctx, slot, &r, hdr, color.clone(), look, ms) {
+                changed = true;
                 continue;
             }
             let rendered = match r.rendered {
@@ -1976,4 +2117,25 @@ fn library_key(session: &Session) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     lib.dir.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod hdr_texel_tests {
+    use super::HdrTexels;
+    use lightcraft_pipeline::{DeepImage, DeepSamples, OutputSpace};
+
+    #[test]
+    fn half_floats_keep_highlights_above_sdr_white() {
+        let deep = DeepImage { width: 2, height: 1, space: OutputSpace::Srgb, samples: DeepSamples::F32(vec![0.0, 0.5, 1.0, 4.0, f32::NAN, -1.0]) };
+        let t = HdrTexels::of(&deep).map(|t| t.data).unwrap_or_default();
+        let back = |h: u16| f32::from_bits(((u32::from(h >> 10) + 127 - 15) << 23) | (u32::from(h & 0x3ff) << 13));
+        assert_eq!(t[0], 0, "black");
+        assert!((back(t[2]) - 1.0).abs() < 1e-3, "SDR white encodes as 1.0");
+        assert!(back(t[1]) < back(t[2]), "darker stays darker");
+        assert!(back(t[4]) > 1.5, "a highlight above SDR white stays above it");
+        assert_eq!((t[5], t[6]), (0, 0), "broken values are black");
+        assert!((back(t[3]) - 1.0).abs() < 1e-3 && (back(t[7]) - 1.0).abs() < 1e-3, "opaque");
+        let short = DeepImage { samples: DeepSamples::F32(vec![1.0; 5]), ..deep };
+        assert!(HdrTexels::of(&short).is_none(), "too few samples for the size");
+    }
 }

@@ -39,6 +39,42 @@ fn steady_hdr_histogram(ctx: &egui::Context, id: PhotoId, hdr_edit: bool, hist: 
     }
 }
 
+/// What the display shows of an HDR edit, in stops above SDR white (the histogram's HDR scale):
+/// `stops` the display's headroom now (0: an SDR display, or HDR off in the OS), `limit` the edit's.
+#[derive(Clone, Copy)]
+struct DisplayRange {
+    stops: f32,
+    limit: f32,
+}
+
+impl DisplayRange {
+    /// For the photo `id` when its edit is HDR.
+    fn of(app: &LightcraftApp, id: PhotoId) -> Option<Self> {
+        let hdr = app.session.develop_of(id).map(|d| d.hdr).filter(|h| h.enabled)?;
+        let stops = app.renderer.hdr_headroom().map_or(0.0, f32::log2).max(0.0);
+        Some(Self { stops, limit: hdr.peak().log2() })
+    }
+
+    /// The sentence for the tooltip and screen readers.
+    fn sentence(self) -> String {
+        let tr = crate::i18n::tr;
+        if self.stops <= 0.0 {
+            tr("This display shows the SDR version of HDR edits (it has no HDR headroom now).").to_string()
+        } else if self.stops >= self.limit {
+            format!("{} {:.1}. {}", tr("Stops this display shows above SDR white now:"), self.stops, tr("That is all of this edit's HDR range."))
+        } else {
+            format!(
+                "{} {:.1}. {}",
+                tr("Stops this display shows above SDR white now:"),
+                self.stops,
+                tr(
+                    "Brighter parts of the edit are shown blended towards its SDR version, as gain map viewers show them. How much it shows follows the display's brightness setting."
+                )
+            )
+        }
+    }
+}
+
 /// The histogram of the last drag's small HDR render, while an HDR edit of `id` is being dragged. It stays in
 /// `Renderer` after the drag, so an edit with HDR switched off must not read it: its drags would show the old HDR
 /// histogram (`dragging`: a drag of an HDR edit is on).
@@ -75,7 +111,11 @@ pub(crate) fn histogram(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId)
     let hdr = flow.hdr_bins();
     let legend = 26.0 * flow.morph;
     let (r, resp) = ui.allocate_exact_size(vec2(w, 118.0 + legend), Sense::click_and_drag());
-    crate::widgets::announce(&resp, crate::i18n::tr("Histogram"));
+    let shown = DisplayRange::of(app, id);
+    match shown.filter(|_| hdr.is_some()) {
+        Some(d) => crate::widgets::announce(&resp, format!("{}. {}", crate::i18n::tr("Histogram"), d.sentence())),
+        None => crate::widgets::announce(&resp, crate::i18n::tr("Histogram")),
+    }
     register(ui, "histogram", r);
     let p = ui.painter();
     p.rect_filled(r, 0.0, t.button);
@@ -108,9 +148,14 @@ pub(crate) fn histogram(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId)
         p.text(pos2((x0 + plot.right()) / 2.0, y), Align2::CENTER_CENTER, crate::i18n::tr("HDR"), t.font(12.5), t.text_label);
         let info = Rect::from_center_size(pos2(plot.right() - 16.0, y), vec2(14.0, 14.0));
         paint(p, info, Icon::Info, t.text_label);
-        ui.interact(info, egui::Id::unique("hdrHistogramInfo"), Sense::hover()).on_hover_text(crate::i18n::tr(
+        let tip = crate::i18n::tr(
             "Left: the standard (SDR) range up to SDR white. Right: the HDR range, one band per stop above SDR white (the orange line: the HDR headroom). With Visualize HDR range on, the bands take its colours.",
-        ));
+        );
+        let tip = match shown {
+            Some(d) => format!("{tip}\n\n{}", d.sentence()),
+            None => tip.to_string(),
+        };
+        ui.interact(info, egui::Id::unique("hdrHistogramInfo"), Sense::hover()).on_hover_text(tip);
     }
     let clipping = hist.as_ref().map(|h| h.clipping());
     // mid-way with no histogram of the new kind yet, the one being left is drawn alone

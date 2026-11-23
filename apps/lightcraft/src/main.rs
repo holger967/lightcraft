@@ -83,7 +83,13 @@ fn app_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(png).unwrap_or_default()
 }
 
-struct App(LightcraftApp, PrefsWriter, Option<WindowTextures>, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>);
+struct App(
+    LightcraftApp,
+    PrefsWriter,
+    Option<WindowTextures>,
+    Option<hdr_display::DisplayRange>,
+    #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>,
+);
 
 /// Draws renders that stayed on the GPU: registers their textures with the window's egui-wgpu
 /// renderer (the GPU renderer runs on the window's device, see [`adopt_window_device`]).
@@ -111,6 +117,42 @@ impl lightcraft_ui_egui::render::ScreenTextures for WindowTextures {
         self.renderer.write().free_texture(&id);
     }
 
+    fn show_hdr(&mut self, texels: &lightcraft_ui_egui::render::HdrTexels, id: Option<egui::TextureId>) -> Option<egui::TextureId> {
+        use eframe::wgpu;
+        let (w, h) = (u32::try_from(texels.width).ok()?, u32::try_from(texels.height).ok()?);
+        let max = self.device.limits().max_texture_dimension_2d;
+        if w == 0 || h == 0 || w > max || h > max || texels.data.len() != texels.width.saturating_mul(texels.height).saturating_mul(4) {
+            return None;
+        }
+        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lightcraft hdr view"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &half_float_bytes(&texels.data),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            size,
+        );
+        let view = texture.create_view(&Default::default());
+        let mut r = self.renderer.write();
+        let filter = wgpu::FilterMode::Linear;
+        Some(match id {
+            Some(id) => {
+                r.update_egui_texture_from_wgpu_texture(&self.device, &view, filter, id);
+                id
+            }
+            None => r.register_native_texture(&self.device, &view, filter),
+        })
+    }
+
     fn read(&self, frame: &lightcraft_engine::media::ScreenFrame) -> Option<egui::ColorImage> {
         match lightcraft_engine::gpu::read_texture(&self.device, &self.queue, &frame.texture, frame.width, frame.height) {
             Ok(img) => Some(egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], img.data.as_flattened())),
@@ -120,6 +162,11 @@ impl lightcraft_ui_egui::render::ScreenTextures for WindowTextures {
             }
         }
     }
+}
+
+/// `texels` (half floats) as the bytes a texture upload takes, in the machine's order (as the GPU reads them).
+fn half_float_bytes(texels: &[u16]) -> Vec<u8> {
+    texels.iter().flat_map(|t| t.to_ne_bytes()).collect()
 }
 
 /// Render on the window's device (off the UI thread: building the kernels takes a moment), so the
@@ -153,7 +200,7 @@ impl eframe::App for App {
     }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
-        if let Some(m) = self.3.as_mut()
+        if let Some(m) = self.4.as_mut()
             && m.update(&mut self.0, ctx)
             && lightcraft_ui_egui::panels::notices::may_close(&mut self.0)
         {
@@ -162,6 +209,10 @@ impl eframe::App for App {
             // process instead of closing the viewport while AppKit is terminating (PR #444).
             eframe::App::on_exit(self, None);
             std::process::exit(0);
+        }
+        // the display's SDR white and HDR headroom (where the window is, at the OS brightness)
+        if let Some(d) = self.3.as_mut() {
+            self.0.renderer.set_hdr_headroom(d.poll(ctx));
         }
         self.0.logic(ctx);
         self.1.tick(&mut self.0, ctx);
@@ -311,7 +362,10 @@ fn main() -> eframe::Result {
         prefs.as_ref().map_or_else(|| lightcraft_ui_egui::state::AppSettings::default().compose_window, |ui| ui.settings.compose_window)
             && std::env::var_os("WGPU_BACKEND").is_none();
     let win_files = std::sync::Arc::new(window_files(in_memory));
-    let window_gpu::Chosen { renderer, wgpu_options, which: window_renderer, notice: window_notice } = window_gpu::choose(&win_files, compose_window);
+    let window_gpu::Chosen { renderer, mut wgpu_options, which: window_renderer, notice: window_notice } =
+        window_gpu::choose(&win_files, compose_window);
+    // HDR display (opt-in while it's being built): a float scRGB / EDR surface when offered
+    wgpu_options.hdr_surface = hdr_display::surface_requested();
     win_files.arm(window_renderer);
     let win_files_app = win_files.clone();
     // the window came up: a failure after this is LightCraft stopping, not a start that failed
@@ -363,6 +417,8 @@ fn main() -> eframe::Result {
                 session = session.with_default_sam3_model();
                 // HDR display: SDR unless the surface, platform and display all allow HDR
                 hdr_display::report(cc.wgpu_render_state.as_ref().map(|r| r.target_format));
+                // on an scRGB surface 1.0 is 80 nits: the UI's white follows the monitor's SDR white level
+                let sdr_white = hdr_display::DisplayRange::new(cc);
                 let mut app = LightcraftApp::new(session, services(cc, app_log_file.as_deref()));
                 app.set_startup_update_check(true);
                 if let Some(ui) = prefs {
@@ -444,6 +500,7 @@ fn main() -> eframe::Result {
                     app,
                     writer,
                     window_textures,
+                    sdr_white,
                     #[cfg(target_os = "macos")]
                     menu,
                 )))
