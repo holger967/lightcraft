@@ -163,6 +163,8 @@ pub fn inspect(app: &LightcraftApp, ctx: &egui::Context) -> Value {
         // commands waiting on a native file dialog shown off the UI thread (`pick`)
         "fileDialogs": app.pending_picks.iter().map(|p| p.command.clone()).collect::<Vec<_>>(),
         "memory": memory(app),
+        // HDR edits are shown brighter than SDR white on this display (`null`: as their SDR rendition)
+        "displayHdrStops": app.renderer.hdr_headroom().map(f32::log2),
     })
 }
 

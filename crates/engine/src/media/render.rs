@@ -45,6 +45,9 @@ pub struct RenderJob {
     /// to a 64 px step) and the window would otherwise shrink the texture with 2-tap bilinear sampling, which blurs fine detail at
     /// small ratios and aliases it at large ones. The caches keep the full render.
     pub display_fit: Option<(usize, usize)>,
+    /// Show an HDR edit on an HDR display ([`Self::with_hdr_display`]): the display's headroom (its
+    /// peak over SDR white) the edit's SDR and HDR renditions are blended for.
+    pub hdr_headroom: Option<f32>,
 }
 
 /// `img` shrunk to fit `max_w × max_h` with a Lanczos filter (see [`RenderJob::display_fit`]).
@@ -191,6 +194,33 @@ impl RenderJob {
         self.key ^= k(&self.display) ^ k(&display);
         self.request.display = display.as_ref().map(|d| d.space);
         self.display = display;
+        self
+    }
+
+    /// For an HDR display with `headroom` (its peak over SDR white, above 1), as gain map viewers
+    /// show a photo (ISO 21496-1): an HDR edit still renders its SDR rendition (the 8-bit image),
+    /// plus its HDR rendition in linear float, and [`Rendered::deep`] is the two blended for the
+    /// display ([`adapt_hdr`]): the SDR rendition on a display without headroom, the HDR one once
+    /// the display reaches the edit's headroom limit, in between by stops. Anything else (an SDR
+    /// edit, no headroom, a thumbnail, slide, overlay or proof) is left as it is. Gets its own
+    /// result key and is never kept as the photo's cached preview.
+    pub fn with_hdr_display(mut self, headroom: Option<f32>) -> Self {
+        let Some(h) = headroom.filter(|h| h.is_finite() && *h > 1.0) else { return self };
+        if !self.settings.hdr.enabled
+            || self.settings.hdr.peak() <= 1.0
+            || self.cache.is_some()
+            || self.slide.is_some()
+            || self.display.is_some()
+            || self.request.depth != lightcraft_pipeline::OutputDepth::U8
+            || self.request.overlay != lightcraft_pipeline::Overlay::None
+            || self.request.proof.is_some()
+        {
+            return self;
+        }
+        self.key ^= u64::from(h.to_bits()).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x4844_5244_4953_504c;
+        self.hdr_headroom = Some(h);
+        self.view_cache = None;
+        self.on_screen = false;
         self
     }
 
@@ -432,6 +462,11 @@ impl RenderJob {
                 {
                     cache.put_deferred_at(self.cache_generation, *key, Arc::new(srgb.unwrap_or_else(|| rendered.image.clone())));
                 }
+                // an HDR display's view: the edit's HDR rendition too, blended with the SDR one below
+                if self.hdr_headroom.is_some() {
+                    let hdr_request = RenderRequest { depth: lightcraft_pipeline::OutputDepth::F32Hdr, ..request };
+                    rendered.deep = develop_image(src, &info, &self.settings, &hdr_request, self.stages.as_deref(), gpu).0.deep;
+                }
                 // the display fit, after the caches have the full render
                 if let Some((fw, fh)) = self.display_fit
                     && self.request.quality == Quality::Full
@@ -439,6 +474,19 @@ impl RenderJob {
                     let (w, h) = (rendered.image.width, rendered.image.height);
                     if w > fw.max(1) || h > fh.max(1) {
                         rendered.image = fit_for_display(&rendered.image, fw, fh);
+                    }
+                    if let Some(deep) = rendered.deep.as_mut()
+                        && (deep.width > fw.max(1) || deep.height > fh.max(1))
+                    {
+                        fit_deep_for_display(deep, fw, fh);
+                    }
+                }
+                if let Some(h) = self.hdr_headroom {
+                    let weight = hdr_weight(h, self.settings.hdr.peak());
+                    let blended = rendered.deep.as_mut().is_some_and(|deep| adapt_hdr(&rendered.image, deep, weight));
+                    if !blended {
+                        // (no HDR rendition to blend: the view shows the 8-bit SDR one)
+                        rendered.deep = None;
                     }
                 }
                 RenderResult {
@@ -458,6 +506,56 @@ impl RenderJob {
             Err(e) => self.failed(e),
         }
     }
+}
+
+/// How far towards the HDR rendition a display with `display_headroom` shows an edit whose HDR
+/// rendition reaches `photo_headroom` (both peaks over SDR white): ISO 21496-1's weight, the
+/// display's headroom in stops over the photo's, from 0 (SDR) to 1 (HDR).
+pub fn hdr_weight(display_headroom: f32, photo_headroom: f32) -> f32 {
+    let (d, p) = (display_headroom.max(1.0).log2(), photo_headroom.log2());
+    if !(d.is_finite() && p.is_finite()) || p <= 0.0 { 0.0 } else { (d / p).clamp(0.0, 1.0) }
+}
+
+/// The offset gain map arithmetic adds to both renditions before their ratio, as our gain map
+/// exports do (`GainMapOptions`' default): keeps blacks finite and their noise quiet.
+const GAIN_OFFSET: f32 = 1.0 / 64.0;
+
+/// `deep` (the HDR rendition, linear float) replaced by what a display shows `weight` of the way
+/// from `sdr` (the 8-bit sRGB SDR rendition, same size) to it, as a gain map viewer applies its map
+/// (ISO 21496-1): per channel, `(sdr + k) · ((hdr + k) / (sdr + k))^weight − k`, so stops blend
+/// linearly. `false` (nothing changed) when the two differ in size or `deep` isn't float.
+pub fn adapt_hdr(sdr: &lightcraft_raster::Rgba8, deep: &mut lightcraft_pipeline::DeepImage, weight: f32) -> bool {
+    let lightcraft_pipeline::DeepSamples::F32(v) = &mut deep.samples else { return false };
+    if (sdr.width, sdr.height) != (deep.width, deep.height) || v.len() != sdr.data.len() * 3 {
+        return false;
+    }
+    let w = if weight.is_finite() { weight.clamp(0.0, 1.0) } else { 1.0 };
+    let k = GAIN_OFFSET;
+    for (hdr, s) in v.as_chunks_mut::<3>().0.iter_mut().zip(&sdr.data) {
+        for c in 0..3 {
+            let base = lightcraft_color::transfer::decode_srgb8(s[c]) + k;
+            let alt = if hdr[c].is_finite() { hdr[c].max(0.0) + k } else { base };
+            hdr[c] = (base * (alt / base).powf(w) - k).max(0.0);
+        }
+    }
+    true
+}
+
+/// `deep` (float samples) shrunk to fit `max_w × max_h` with a Lanczos filter, like
+/// [`fit_for_display`] for the 8-bit image. Other sample formats are left as they are.
+fn fit_deep_for_display(deep: &mut lightcraft_pipeline::DeepImage, max_w: usize, max_h: usize) {
+    use lightcraft_raster::resample::{Filter, fit};
+    let lightcraft_pipeline::DeepSamples::F32(v) = &deep.samples else { return };
+    let f = lightcraft_raster::Image {
+        width: deep.width,
+        height: deep.height,
+        data: v.as_chunks::<3>().0.iter().map(|p| [p[0], p[1], p[2], 1.0]).collect(),
+    };
+    let small = fit(&f, max_w.max(1), max_h.max(1), Filter::Lanczos3);
+    deep.width = small.width;
+    deep.height = small.height;
+    // (Lanczos rings a little below zero next to bright edges)
+    deep.samples = lightcraft_pipeline::DeepSamples::F32(small.data.iter().flat_map(|p| [p[0].max(0.0), p[1].max(0.0), p[2].max(0.0)]).collect());
 }
 
 /// `img` fitted into `max_w × max_h` (its aspect kept), when it is big enough to need no
